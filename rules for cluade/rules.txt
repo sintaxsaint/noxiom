@@ -1,0 +1,5 @@
+must be from scratch
+must do what was said in the readme
+must be small size
+must use minimal ram and cpu
+must be a server OS
