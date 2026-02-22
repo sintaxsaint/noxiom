@@ -58,27 +58,45 @@ jobs:
             curl -sL "$FW/$f" -o "pi-fw/$f"
           done
 
-      - name: Create arm64 FAT32 SD card image
+      - name: Create arm64 SD card image
         run: |
-          # 64 MB is plenty for firmware files + kernel (total ~30 MB)
-          dd if=/dev/zero of=imgs/noxiom-arm64.img bs=1M count=64 status=none
-          mkfs.fat -F 32 -n NOXIOM imgs/noxiom-arm64.img
+          # Create a 128MB image with a proper MBR partition table.
+          # A raw superfloppy (no MBR) confuses the Pi 5 bootloader when the
+          # SD card previously had other partitions — it sees leftover data and
+          # reports "partition N unreadable".  A clean MBR with one explicit
+          # FAT32 partition avoids this entirely.
+          dd if=/dev/zero of=imgs/noxiom-arm64.img bs=1M count=128 status=none
 
-          # mtools lets us copy files into FAT images without root/mount
-          mcopy -i imgs/noxiom-arm64.img pi-fw/bootcode.bin   ::bootcode.bin
-          mcopy -i imgs/noxiom-arm64.img pi-fw/start.elf      ::start.elf
-          mcopy -i imgs/noxiom-arm64.img pi-fw/fixup.dat      ::fixup.dat
-          mcopy -i imgs/noxiom-arm64.img pi-fw/start4.elf     ::start4.elf
-          mcopy -i imgs/noxiom-arm64.img pi-fw/fixup4.dat     ::fixup4.dat
-          mcopy -i imgs/noxiom-arm64.img pi-fw/start_cd.elf   ::start_cd.elf
-          mcopy -i imgs/noxiom-arm64.img pi-fw/fixup_cd.dat   ::fixup_cd.dat
-          mcopy -i imgs/noxiom-arm64.img \
-                noxiom/build/arm64/kernel8.img                ::kernel8.img
-          mcopy -i imgs/noxiom-arm64.img \
-                noxiom/arch/arm64/boot/config.txt             ::config.txt
+          # MBR: one primary FAT32 partition starting at 1 MiB
+          parted -s imgs/noxiom-arm64.img mktable msdos
+          parted -s imgs/noxiom-arm64.img mkpart primary fat32 1MiB 100%
 
-          echo "arm64 image contents:"
-          mdir -i imgs/noxiom-arm64.img
+          # Format the partition in-place.
+          # The partition starts at sector 2048 (1 MiB / 512 B).
+          mkfs.fat -F 32 -n NOXIOM --offset 2048 imgs/noxiom-arm64.img
+
+          # mtools can address a partition at a byte offset without root/mount.
+          OFFSET=$(( 2048 * 512 ))
+          echo "drive b: file=\"imgs/noxiom-arm64.img\" offset=$OFFSET" \
+            > /tmp/mtoolsrc
+          export MTOOLS_SKIP_CHECK=1
+
+          cp_fat() { MTOOLSRC=/tmp/mtoolsrc mcopy -i imgs/noxiom-arm64.img@@$OFFSET "$1" "::$2"; }
+
+          cp_fat pi-fw/bootcode.bin   bootcode.bin
+          cp_fat pi-fw/start.elf      start.elf
+          cp_fat pi-fw/fixup.dat      fixup.dat
+          cp_fat pi-fw/start4.elf     start4.elf
+          cp_fat pi-fw/fixup4.dat     fixup4.dat
+          cp_fat pi-fw/start_cd.elf   start_cd.elf
+          cp_fat pi-fw/fixup_cd.dat   fixup_cd.dat
+          cp_fat noxiom/build/arm64/kernel8.img    kernel8.img
+          # Pi 5 looks for kernel_2712.img first — provide same binary under that name
+          cp_fat noxiom/build/arm64/kernel8.img    kernel_2712.img
+          cp_fat noxiom/noxiom/arch/arm64/boot/config.txt  config.txt
+
+          echo "arm64 image partition contents:"
+          MTOOLSRC=/tmp/mtoolsrc mdir -i imgs/noxiom-arm64.img@@$OFFSET
 
       # ── Publish pre-release ───────────────────────────────────────────────
       - name: Delete old nightly pre-release (if exists)

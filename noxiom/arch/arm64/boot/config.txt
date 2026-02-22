@@ -1,17 +1,26 @@
 # Raspberry Pi firmware config — Noxiom OS
-# Works on Pi 3, Pi 4, and Pi 5 (firmware auto-selects kernel8.img for 64-bit)
 
-# Load 64-bit AArch64 kernel (filename kernel8.img is the 64-bit convention)
-arm_64bit=1
+# Global settings (all Pi models)
+arm_64bit=1      # load 64-bit AArch64 kernel
+gpu_mem=16       # minimum GPU memory — server OS, no graphics
+enable_uart=1    # enable UART on GPIO 14/15
 
-# Reduce GPU memory to minimum — Noxiom is a server OS with no graphics
-gpu_mem=16
-
-# Enable UART on GPIO 14/15 (TX/RX)
-enable_uart=1
-
-# Pi 3 only: swap mini-UART and PL011 so we get the full PL011 on GPIO 14.
-# (The mini-UART is unreliable at high baud rates due to its dependence on
-#  the VPU core clock.  PL011 uses a fixed 48 MHz reference clock.)
-# This has no effect on Pi 4/5 which always use PL011 on GPIO 14.
+# ── Pi 3 ────────────────────────────────────────────────────────────────────
+# Swap mini-UART and PL011 so GPIO 14 gets the reliable fixed-clock PL011.
+# (mini-UART baud rate drifts with VPU clock — unusable at 115200)
+[pi3]
 dtoverlay=miniuart-bt
+
+# ── Pi 4 ────────────────────────────────────────────────────────────────────
+# PL011 is on GPIO 14 by default — no overlay needed.
+[pi4]
+
+# ── Pi 5 ────────────────────────────────────────────────────────────────────
+# Pi 5 looks for kernel_2712.img first (Cortex-A76 optimised).
+# Providing it as a copy of kernel8.img prevents the "unsupported OS" warning.
+# PL011 is the only UART on Pi 5 — no overlay needed.
+[pi5]
+kernel=kernel_2712.img
+
+# ── All models ───────────────────────────────────────────────────────────────
+[all]
