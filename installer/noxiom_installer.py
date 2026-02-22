@@ -89,6 +89,8 @@ _WIN_ERRORS = {
     32:   "Drive in use by another program. Close File Explorer and retry.",
     87:   "Invalid parameter (buffer alignment). Please report this bug.",
     112:  "Not enough space on the drive.",
+    483:  "Storage driver blocked write (a partition may still be online). "
+          "Eject and reinsert the card, then retry.",
     1117: "I/O device error. Try a different USB port or SD card.",
     1224: "Drive locked by another application. Close File Explorer and retry.",
 }
