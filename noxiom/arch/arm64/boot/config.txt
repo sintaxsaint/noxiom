@@ -1,0 +1,17 @@
+# Raspberry Pi firmware config — Noxiom OS
+# Works on Pi 3, Pi 4, and Pi 5 (firmware auto-selects kernel8.img for 64-bit)
+
+# Load 64-bit AArch64 kernel (filename kernel8.img is the 64-bit convention)
+arm_64bit=1
+
+# Reduce GPU memory to minimum — Noxiom is a server OS with no graphics
+gpu_mem=16
+
+# Enable UART on GPIO 14/15 (TX/RX)
+enable_uart=1
+
+# Pi 3 only: swap mini-UART and PL011 so we get the full PL011 on GPIO 14.
+# (The mini-UART is unreliable at high baud rates due to its dependence on
+#  the VPU core clock.  PL011 uses a fixed 48 MHz reference clock.)
+# This has no effect on Pi 4/5 which always use PL011 on GPIO 14.
+dtoverlay=miniuart-bt

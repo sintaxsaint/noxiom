@@ -1,57 +1,66 @@
-#include "vga.h"
-#include "serial.h"
-#include "gdt.h"
-#include "idt.h"
-#include "pic.h"
-#include "keyboard.h"
+#include "hal.h"
 #include "shell/shell.h"
 
+static void print_hw_info(void) {
+    hal_display_set_color(HAL_COLOR(HAL_COLOR_YELLOW, HAL_COLOR_BLACK));
+    hal_display_print("[hal] CPU: ");
+    hal_display_set_color(HAL_COLOR(HAL_COLOR_LIGHT_GREY, HAL_COLOR_BLACK));
+    hal_display_print(g_hw_info.model_str);
+    hal_display_print("  Tier: ");
+    switch (g_hw_info.tier) {
+        case TIER_HIGH:     hal_display_print("HIGH\n");     break;
+        case TIER_MID:      hal_display_print("MID\n");      break;
+        case TIER_LOW:      hal_display_print("LOW\n");      break;
+        case TIER_FALLBACK: hal_display_print("FALLBACK\n"); break;
+        default:            hal_display_print("UNKNOWN\n");  break;
+    }
+}
+
 static void print_banner(void) {
-    /* Top border */
-    vga_set_color(VGA_COLOR(VGA_CYAN, VGA_BLACK));
-    vga_print("================================================================================");
-
-    /* Title */
-    vga_set_color(VGA_COLOR(VGA_WHITE, VGA_BLACK));
-    vga_print("\n");
-    vga_print("                              N O X I O M   O S\n");
-    vga_print("                         Lightweight Server Operating System\n");
-    vga_print("                                  Version 0.1.0\n");
-    vga_print("\n");
-
-    /* Bottom border */
-    vga_set_color(VGA_COLOR(VGA_CYAN, VGA_BLACK));
-    vga_print("================================================================================");
-
-    vga_set_color(VGA_COLOR(VGA_LIGHT_GREY, VGA_BLACK));
-    vga_print("\n\n");
-    vga_print("Type 'help' for a list of commands.\n\n");
+    hal_display_set_color(HAL_COLOR(HAL_COLOR_CYAN, HAL_COLOR_BLACK));
+    hal_display_print("================================================================================");
+    hal_display_set_color(HAL_COLOR(HAL_COLOR_WHITE, HAL_COLOR_BLACK));
+    hal_display_print("\n");
+    hal_display_print("                              N O X I O M   O S\n");
+    hal_display_print("                         Lightweight Server Operating System\n");
+    hal_display_print("                                  Version 0.1.0\n");
+    hal_display_print("\n");
+    hal_display_set_color(HAL_COLOR(HAL_COLOR_CYAN, HAL_COLOR_BLACK));
+    hal_display_print("================================================================================");
+    hal_display_set_color(HAL_COLOR(HAL_COLOR_LIGHT_GREY, HAL_COLOR_BLACK));
+    hal_display_print("\n\nType 'help' for a list of commands.\n\n");
 }
 
 void kmain(void) {
-    serial_init();
-    serial_print("[noxiom] kernel started\n");
+    /* 1. Serial first — always works, gives us early debug output */
+    hal_serial_init();
+    hal_serial_print("[noxiom] kernel started\n");
 
-    vga_init();
-    serial_print("[noxiom] vga ok\n");
+    /* 2. Detect hardware properties and compute tier */
+    hal_hw_detect();
+    g_hw_info.tier = hal_hw_score();
+    hal_serial_print("[noxiom] hw detected\n");
 
-    gdt_init();
-    serial_print("[noxiom] gdt ok\n");
+    /* 3. CPU descriptor tables (GDT+IDT on x86; VBAR_EL1 on arm64) */
+    hal_cpu_init();
+    hal_serial_print("[noxiom] cpu ok\n");
 
-    pic_init();
-    serial_print("[noxiom] pic ok\n");
+    /* 4. Interrupt controller (PIC on x86; GIC on arm64) */
+    hal_intc_init();
+    hal_serial_print("[noxiom] intc ok\n");
 
-    idt_init();
-    serial_print("[noxiom] idt ok\n");
+    /* 5. Display */
+    hal_display_init();
+    hal_serial_print("[noxiom] display ok\n");
 
-    keyboard_init();
-    serial_print("[noxiom] keyboard ok\n");
+    /* 6. Input */
+    hal_input_init();
+    hal_serial_print("[noxiom] input ok\n");
 
+    print_hw_info();
     print_banner();
-    serial_print("[noxiom] entering shell\n");
+    hal_serial_print("[noxiom] entering shell\n");
 
     shell_run();
-
-    /* shell_run() never returns, but just in case */
-    for (;;) __asm__ volatile ("hlt");
+    hal_halt();
 }
