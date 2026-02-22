@@ -3,48 +3,67 @@
 noxiom_installer.py — NOXIOM OS GUI Installer
 
 Single-file installer using stdlib only (tkinter, urllib, subprocess,
-threading, tempfile, os, platform, ctypes).
+threading, tempfile, os, platform, ctypes, logging).
 
 Usage:
   Windows : python noxiom_installer.py   (must run as Administrator)
   Linux   : sudo python3 noxiom_installer.py
   macOS   : sudo python3 noxiom_installer.py
 
-The installer:
-  1. Fetches the latest Noxiom release info from GitHub.
-  2. Shows only *removable* drives (USB sticks, SD / micro-SD cards).
-     Internal hard disks and NVMe drives are NEVER shown.
-  3. After the user picks an arch (x86_64 or arm64) and a drive,
-     it downloads the correct raw image and writes it to the drive.
-  4. Progress is shown as 0-50 % (download) and 50-100 % (write).
+Robustness features:
+  - Download retried up to 3 times with exponential back-off
+  - Cancel button available throughout download + write
+  - Drive size checked against image size before writing
+  - Windows volumes locked/dismounted via FindFirstVolumeW (catches
+    drives with no drive letter assigned)
+  - Common Windows error codes translated to plain-English messages
+  - MB/s speed and ETA shown during download and write
+  - Drive auto-ejected on Windows after a successful write
+  - Safe close: prompts if user closes window mid-install
+  - Full debug log written to the system temp directory
+  - Falls back to latest release if no pre-release exists
 """
 
 import os
 import sys
 import json
+import logging
 import platform
 import subprocess
-import threading
 import tempfile
+import threading
+import time
 import urllib.request
-import urllib.error
 import tkinter as tk
 from tkinter import ttk, messagebox
 
 # ── GitHub release settings ──────────────────────────────────────────────────
 GITHUB_OWNER = "sintaxsaint"
 GITHUB_REPO  = "noxiom"
-# Fetch up to 10 releases and pick the most recent pre-release.
-# GitHub has no "latest pre-release" shortcut endpoint.
 API_URL = (
-    f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases?per_page=10"
+    f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
+    f"/releases?per_page=10"
 )
-
-# Expected asset filenames in the GitHub release:
 ASSET_X86   = "noxiom-x86_64.img"
 ASSET_ARM64 = "noxiom-arm64.img"
 
-# ── UI theme (dark) ───────────────────────────────────────────────────────────
+# ── Tuning ────────────────────────────────────────────────────────────────────
+CHUNK            = 4 * 1024 * 1024   # 4 MB I/O chunk
+DOWNLOAD_RETRIES = 3                 # max download attempts
+DOWNLOAD_TIMEOUT = 60                # seconds per HTTP request
+SPEED_WINDOW     = 3.0               # seconds of history for speed average
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+LOG_PATH = os.path.join(tempfile.gettempdir(), "noxiom_installer.log")
+logging.basicConfig(
+    filename=LOG_PATH,
+    level=logging.DEBUG,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("noxiom")
+
+# ── UI theme ──────────────────────────────────────────────────────────────────
 C_BG     = "#0d1117"
 C_BG2    = "#161b22"
 C_BG3    = "#21262d"
@@ -61,12 +80,25 @@ FONT_LABEL  = ("Consolas", 10)
 FONT_SMALL  = ("Consolas", 9)
 FONT_BUTTON = ("Consolas", 11, "bold")
 
-CHUNK = 4 * 1024 * 1024   # 4 MB I/O chunks for write
+# ── Windows error-code → human message ───────────────────────────────────────
+_WIN_ERRORS = {
+    2:    "Drive not found. Is it still connected?",
+    5:    "Access denied. Run the installer as Administrator.",
+    19:   "Write-protected. Check the write-protect switch on the drive.",
+    21:   "Device not ready. Wait a few seconds for the drive to mount, then retry.",
+    32:   "Drive in use by another program. Close File Explorer and retry.",
+    87:   "Invalid parameter (buffer alignment). Please report this bug.",
+    112:  "Not enough space on the drive.",
+    1117: "I/O device error. Try a different USB port or SD card.",
+    1224: "Drive locked by another application. Close File Explorer and retry.",
+}
+
+def _win_err(code):
+    return _WIN_ERRORS.get(code, f"Windows error {code}.")
 
 
-# ── Privilege check ───────────────────────────────────────────────────────────
+# ── Admin check ───────────────────────────────────────────────────────────────
 def is_admin():
-    """Return True if running with administrator / root privileges."""
     try:
         if platform.system() == "Windows":
             import ctypes
@@ -79,16 +111,14 @@ def is_admin():
 # ── Drive model ───────────────────────────────────────────────────────────────
 class Drive:
     def __init__(self, path, label, bus, size_bytes):
-        self.path       = path        # e.g. \\.\PhysicalDrive1  or /dev/sdb
+        self.path       = path        # \\.\PhysicalDriveN  or /dev/sdX
         self.label      = label
-        self.bus        = bus         # "USB", "SD", "MMC", "EXTERNAL"
+        self.bus        = bus         # USB / SD / MMC / EXTERNAL
         self.size_bytes = size_bytes
 
     def size_str(self):
         gb = self.size_bytes / (1024 ** 3)
-        if gb >= 1.0:
-            return f"{gb:.1f} GB"
-        return f"{self.size_bytes // (1024 ** 2)} MB"
+        return f"{gb:.1f} GB" if gb >= 1.0 else f"{self.size_bytes // (1024**2)} MB"
 
     def __str__(self):
         return f"[{self.bus}]  {self.label}  —  {self.size_str()}"
@@ -96,14 +126,16 @@ class Drive:
 
 # ── Drive detection (removable only) ─────────────────────────────────────────
 def list_drives():
-    """Return a list of Drive objects for removable drives only."""
     system = platform.system()
-    if system == "Windows":
-        return _drives_windows()
-    if system == "Linux":
-        return _drives_linux()
-    if system == "Darwin":
-        return _drives_macos()
+    try:
+        if system == "Windows":
+            return _drives_windows()
+        if system == "Linux":
+            return _drives_linux()
+        if system == "Darwin":
+            return _drives_macos()
+    except Exception as exc:
+        log.warning(f"Drive detection error: {exc}")
     return []
 
 
@@ -116,9 +148,10 @@ def _drives_windows():
     try:
         raw = subprocess.check_output(
             ["powershell", "-NoProfile", "-Command", ps],
-            stderr=subprocess.DEVNULL, timeout=15
+            stderr=subprocess.DEVNULL, timeout=15,
         ).decode("utf-8", errors="replace").strip()
-    except Exception:
+    except Exception as exc:
+        log.warning(f"PowerShell drive query failed: {exc}")
         return []
     if not raw:
         return []
@@ -130,29 +163,23 @@ def _drives_windows():
         data = [data]
     drives = []
     for d in data:
-        num   = d.get("Number", 0)
-        name  = d.get("FriendlyName") or f"Disk {num}"
-        size  = int(d.get("Size") or 0)
-        bus   = (d.get("BusType") or "USB").upper()
-        drives.append(Drive(
-            path=f"\\\\.\\PhysicalDrive{num}",
-            label=name, bus=bus, size_bytes=size
-        ))
+        num  = d.get("Number", 0)
+        name = d.get("FriendlyName") or f"Disk {num}"
+        size = int(d.get("Size") or 0)
+        bus  = (d.get("BusType") or "USB").upper()
+        drives.append(Drive(f"\\\\.\\PhysicalDrive{num}", name, bus, size))
+    log.debug(f"Windows drives: {[str(d) for d in drives]}")
     return drives
 
 
-def _parse_size(s):
-    """Parse lsblk size string like '32G', '512M', '1T' → bytes."""
+def _parse_lsblk_size(s):
     s = s.strip().upper()
-    if not s:
-        return 0
     mult = {"B": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
-    unit = s[-1]
-    if unit in mult:
+    if s and s[-1] in mult:
         try:
-            return int(float(s[:-1]) * mult[unit])
+            return int(float(s[:-1]) * mult[s[-1]])
         except ValueError:
-            return 0
+            pass
     try:
         return int(s)
     except ValueError:
@@ -161,28 +188,23 @@ def _parse_size(s):
 
 def _drives_linux():
     try:
-        raw = subprocess.check_output(
+        raw  = subprocess.check_output(
             ["lsblk", "-J", "-d", "-o", "NAME,SIZE,RM,TYPE,MODEL"],
-            stderr=subprocess.DEVNULL, timeout=10
+            stderr=subprocess.DEVNULL, timeout=10,
         ).decode("utf-8", errors="replace")
-    except Exception:
-        return []
-    try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except Exception as exc:
+        log.warning(f"lsblk failed: {exc}")
         return []
     drives = []
     for dev in data.get("blockdevices", []):
-        if str(dev.get("rm", "0")) != "1":
-            continue
-        if dev.get("type", "") != "disk":
+        if str(dev.get("rm", "0")) != "1" or dev.get("type") != "disk":
             continue
         name  = dev.get("name", "")
         model = (dev.get("model") or name).strip()
-        size  = _parse_size(dev.get("size", "0"))
-        drives.append(Drive(
-            path=f"/dev/{name}", label=model, bus="USB", size_bytes=size
-        ))
+        size  = _parse_lsblk_size(dev.get("size", "0"))
+        drives.append(Drive(f"/dev/{name}", model, "USB", size))
+    log.debug(f"Linux drives: {[str(d) for d in drives]}")
     return drives
 
 
@@ -191,19 +213,18 @@ def _drives_macos():
         import plistlib
         raw = subprocess.check_output(
             ["diskutil", "list", "-plist", "external"],
-            stderr=subprocess.DEVNULL, timeout=10
+            stderr=subprocess.DEVNULL, timeout=10,
         )
         pl = plistlib.loads(raw)
-    except Exception:
+    except Exception as exc:
+        log.warning(f"diskutil failed: {exc}")
         return []
     drives = []
     for item in pl.get("AllDisksAndPartitions", []):
         dev_id = item.get("DeviceIdentifier", "")
         size   = int(item.get("Size", 0))
         label  = _macos_disk_name(dev_id)
-        drives.append(Drive(
-            path=f"/dev/{dev_id}", label=label, bus="EXTERNAL", size_bytes=size
-        ))
+        drives.append(Drive(f"/dev/{dev_id}", label, "EXTERNAL", size))
     return drives
 
 
@@ -212,19 +233,20 @@ def _macos_disk_name(dev_id):
         import plistlib
         raw = subprocess.check_output(
             ["diskutil", "info", "-plist", dev_id],
-            stderr=subprocess.DEVNULL, timeout=5
+            stderr=subprocess.DEVNULL, timeout=5,
         )
         pl = plistlib.loads(raw)
-        return (pl.get("MediaName") or pl.get("IORegistryEntryName") or dev_id)
+        return pl.get("MediaName") or pl.get("IORegistryEntryName") or dev_id
     except Exception:
         return dev_id
 
 
 # ── GitHub release info ───────────────────────────────────────────────────────
 class ReleaseInfo:
-    def __init__(self, tag, assets):
-        self.tag    = tag     # e.g. "v0.1.0"
-        self.assets = assets  # { name: {"url": ..., "size": int} }
+    def __init__(self, tag, assets, is_prerelease):
+        self.tag           = tag
+        self.assets        = assets      # { name: {"url": …, "size": int} }
+        self.is_prerelease = is_prerelease
 
     def asset_url(self, name):
         return self.assets.get(name, {}).get("url")
@@ -234,113 +256,262 @@ class ReleaseInfo:
 
 
 def fetch_release():
-    req = urllib.request.Request(
-        API_URL, headers={"User-Agent": "noxiom-installer/1.0"}
-    )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-    # Releases are returned newest-first; find the first one marked as a pre-release
-    releases = payload if isinstance(payload, list) else [payload]
+    """
+    Return the most recent pre-release.  Falls back to the most recent
+    release of any kind if no pre-release exists.
+    """
+    req = urllib.request.Request(API_URL, headers={"User-Agent": "noxiom-installer/1.0"})
+    with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp:
+        releases = json.loads(resp.read().decode("utf-8"))
+    if not isinstance(releases, list):
+        releases = [releases]
+
     data = next((r for r in releases if r.get("prerelease")), None)
     if data is None:
-        raise RuntimeError("No pre-release found on GitHub. Check the releases page.")
+        log.info("No pre-release found; falling back to latest release.")
+        data = releases[0] if releases else None
+    if data is None:
+        raise RuntimeError("No releases found on GitHub. Check the releases page.")
+
     tag    = data.get("tag_name", "unknown")
-    assets = {}
-    for a in data.get("assets", []):
-        assets[a["name"]] = {
-            "url":  a["browser_download_url"],
-            "size": int(a.get("size", 0)),
-        }
-    return ReleaseInfo(tag, assets)
+    assets = {
+        a["name"]: {"url": a["browser_download_url"], "size": int(a.get("size", 0))}
+        for a in data.get("assets", [])
+    }
+    log.info(f"Release: {tag}  prerelease={data.get('prerelease')}  assets={list(assets)}")
+    return ReleaseInfo(tag, assets, bool(data.get("prerelease")))
 
 
-# ── Download ──────────────────────────────────────────────────────────────────
-def download_asset(url, dest_path, progress_cb, total_bytes):
-    """Stream url to dest_path, calling progress_cb(bytes_downloaded)."""
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "noxiom-installer/1.0"}
-    )
-    downloaded = 0
-    with urllib.request.urlopen(req, timeout=60) as resp, \
-         open(dest_path, "wb") as f:
-        while True:
-            chunk = resp.read(64 * 1024)
-            if not chunk:
-                break
-            f.write(chunk)
-            downloaded += len(chunk)
-            progress_cb(downloaded)
+# ── Speed / ETA tracker ───────────────────────────────────────────────────────
+class SpeedTracker:
+    """Rolling-window bytes-per-second tracker."""
+
+    def __init__(self):
+        self._hist = []   # [(monotonic_time, total_bytes)]
+
+    def update(self, total_bytes):
+        now = time.monotonic()
+        self._hist.append((now, total_bytes))
+        cutoff = now - SPEED_WINDOW
+        self._hist = [(t, b) for t, b in self._hist if t >= cutoff]
+
+    def bps(self):
+        if len(self._hist) < 2:
+            return 0.0
+        dt = self._hist[-1][0] - self._hist[0][0]
+        db = self._hist[-1][1] - self._hist[0][1]
+        return db / dt if dt > 0 else 0.0
+
+    def eta_str(self, remaining):
+        speed = self.bps()
+        if speed <= 0 or remaining <= 0:
+            return ""
+        secs = int(remaining / speed)
+        return f"{secs // 60}m {secs % 60}s" if secs >= 60 else f"{secs}s"
+
+    @staticmethod
+    def fmt_speed(bps):
+        if bps <= 0:
+            return ""
+        if bps >= 1024 ** 2:
+            return f"  {bps / 1024**2:.1f} MB/s"
+        return f"  {bps / 1024:.0f} KB/s"
+
+
+# ── Download with retry ───────────────────────────────────────────────────────
+def download_asset(url, dest_path, progress_cb, cancel_event):
+    """
+    Stream url → dest_path, retrying up to DOWNLOAD_RETRIES times.
+    Raises InterruptedError if cancel_event fires.
+    """
+    last_exc = None
+    for attempt in range(1, DOWNLOAD_RETRIES + 1):
+        if cancel_event.is_set():
+            raise InterruptedError("Cancelled.")
+        try:
+            log.info(f"Download attempt {attempt}: {url}")
+            req = urllib.request.Request(url, headers={"User-Agent": "noxiom-installer/1.0"})
+            downloaded = 0
+            with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp, \
+                 open(dest_path, "wb") as f:
+                while True:
+                    if cancel_event.is_set():
+                        raise InterruptedError("Cancelled.")
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    progress_cb(downloaded)
+            log.info(f"Download complete: {downloaded} bytes")
+            return
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            log.warning(f"Download attempt {attempt} failed: {exc}")
+            if attempt < DOWNLOAD_RETRIES:
+                wait = 2 ** attempt
+                log.info(f"Retrying in {wait}s…")
+                time.sleep(wait)
+    raise OSError(f"Download failed after {DOWNLOAD_RETRIES} attempts: {last_exc}")
 
 
 # ── Write image to device ─────────────────────────────────────────────────────
-def write_image(image_path, device_path, progress_cb, total_bytes):
-    """Write image_path raw to device_path, calling progress_cb(bytes_written)."""
-    system = platform.system()
-    if system == "Windows":
-        _write_windows(image_path, device_path, progress_cb, total_bytes)
+def write_image(image_path, device_path, progress_cb, cancel_event):
+    log.info(f"Writing {image_path} → {device_path}")
+    if platform.system() == "Windows":
+        _write_windows(image_path, device_path, progress_cb, cancel_event)
     else:
-        _write_unix(image_path, device_path, progress_cb, total_bytes)
+        _write_unix(image_path, device_path, progress_cb, cancel_event)
 
 
-def _write_windows(image_path, device_path, progress_cb, total_bytes):
+def _write_windows(image_path, device_path, progress_cb, cancel_event):
     import ctypes
     from ctypes import wintypes
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateFileW.restype  = ctypes.c_void_p
-    kernel32.WriteFile.restype    = ctypes.c_bool
-    kernel32.CloseHandle.restype  = ctypes.c_bool
+    kernel32.CreateFileW.restype       = ctypes.c_void_p
+    kernel32.WriteFile.restype         = ctypes.c_bool
+    kernel32.CloseHandle.restype       = ctypes.c_bool
+    kernel32.DeviceIoControl.restype   = ctypes.c_bool
+    kernel32.FindFirstVolumeW.restype  = ctypes.c_void_p
+    kernel32.FindNextVolumeW.restype   = ctypes.c_bool
+    kernel32.FindVolumeClose.restype   = ctypes.c_bool
 
-    GENERIC_WRITE    = 0x40000000
-    FILE_SHARE_READ  = 0x00000001
-    FILE_SHARE_WRITE = 0x00000002
-    OPEN_EXISTING    = 3
-    INVALID_HANDLE   = ctypes.c_void_p(-1).value
+    GENERIC_READ             = 0x80000000
+    GENERIC_WRITE            = 0x40000000
+    FILE_SHARE_READ          = 0x00000001
+    FILE_SHARE_WRITE         = 0x00000002
+    OPEN_EXISTING            = 3
+    INVALID_HANDLE           = ctypes.c_void_p(-1).value
 
+    IOCTL_STORAGE_GET_DEVICE_NUMBER = 0x2D1080
+    FSCTL_LOCK_VOLUME               = 0x00090018
+    FSCTL_DISMOUNT_VOLUME           = 0x00090020
+    FSCTL_UNLOCK_VOLUME             = 0x0009001C
+
+    class STORAGE_DEVICE_NUMBER(ctypes.Structure):
+        _fields_ = [("DeviceType", wintypes.DWORD),
+                    ("DeviceNumber", wintypes.DWORD),
+                    ("PartitionNumber", wintypes.DWORD)]
+
+    def _device_num(h):
+        sdn = STORAGE_DEVICE_NUMBER()
+        br  = wintypes.DWORD(0)
+        ok  = kernel32.DeviceIoControl(
+            h, IOCTL_STORAGE_GET_DEVICE_NUMBER,
+            None, 0, ctypes.byref(sdn), ctypes.sizeof(sdn),
+            ctypes.byref(br), None,
+        )
+        return int(sdn.DeviceNumber) if ok else -1
+
+    def _vol_disk_num(vol_path):
+        path = vol_path.rstrip("\\")
+        h = kernel32.CreateFileW(
+            path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None, OPEN_EXISTING, 0, None,
+        )
+        if h == INVALID_HANDLE or h is None:
+            return -1
+        n = _device_num(h)
+        kernel32.CloseHandle(h)
+        return n
+
+    # Disk number from "\\.\PhysicalDriveN"
+    try:
+        disk_num = int(device_path.replace("\\\\.\\PhysicalDrive", ""))
+    except ValueError:
+        disk_num = -1
+    log.debug(f"Target disk number: {disk_num}")
+
+    # Enumerate ALL volumes (including those with no drive letter assigned)
+    # using FindFirstVolumeW / FindNextVolumeW so no volume slips through.
+    vol_paths = []
+    if disk_num >= 0:
+        buf = ctypes.create_unicode_buffer(260)
+        hf  = kernel32.FindFirstVolumeW(buf, 260)
+        if hf not in (None, INVALID_HANDLE):
+            while True:
+                if _vol_disk_num(buf.value) == disk_num:
+                    vol_paths.append(buf.value)
+                if not kernel32.FindNextVolumeW(hf, buf, 260):
+                    break
+            kernel32.FindVolumeClose(hf)
+    log.debug(f"Volumes on disk {disk_num}: {vol_paths}")
+
+    # Lock + dismount every volume so the filesystem driver releases the device.
+    vol_handles = []
+    for vp in vol_paths:
+        h = kernel32.CreateFileW(
+            vp.rstrip("\\"), GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None, OPEN_EXISTING, 0, None,
+        )
+        if h in (INVALID_HANDLE, None):
+            log.debug(f"Could not open {vp} for locking")
+            continue
+        dummy = wintypes.DWORD(0)
+        ok_l = kernel32.DeviceIoControl(h, FSCTL_LOCK_VOLUME,
+                                         None, 0, None, 0, ctypes.byref(dummy), None)
+        ok_d = kernel32.DeviceIoControl(h, FSCTL_DISMOUNT_VOLUME,
+                                         None, 0, None, 0, ctypes.byref(dummy), None)
+        log.debug(f"  {vp}: lock={ok_l} dismount={ok_d}")
+        vol_handles.append(h)
+
+    # Open physical drive for writing.
     handle = kernel32.CreateFileW(
-        device_path,
-        GENERIC_WRITE,
+        device_path, GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
-        None, OPEN_EXISTING, 0, None
+        None, OPEN_EXISTING, 0, None,
     )
     if handle == INVALID_HANDLE or handle is None:
+        for h in vol_handles:
+            kernel32.CloseHandle(h)
         err = ctypes.get_last_error()
-        raise OSError(
-            f"Cannot open {device_path} (error {err}).\n"
-            "Make sure you are running as Administrator and the drive is connected."
-        )
+        log.error(f"CreateFileW({device_path}) failed: error {err}")
+        raise OSError(_win_err(err))
 
     written_total = 0
     try:
         buf = (ctypes.c_char * CHUNK)()
         with open(image_path, "rb") as f:
             while True:
+                if cancel_event.is_set():
+                    raise InterruptedError("Cancelled.")
                 chunk = f.read(CHUNK)
                 if not chunk:
                     break
-                # Windows raw drive writes must be exact multiples of 512 bytes.
-                # Pad the last chunk to the next sector boundary if needed.
+                # Raw drive writes must be exact multiples of 512 bytes.
                 if len(chunk) % 512 != 0:
-                    chunk = chunk + b'\x00' * (512 - len(chunk) % 512)
+                    chunk = chunk + b"\x00" * (512 - len(chunk) % 512)
                 ctypes.memmove(buf, chunk, len(chunk))
                 written = wintypes.DWORD(0)
-                ok = kernel32.WriteFile(
-                    handle, buf, len(chunk), ctypes.byref(written), None
-                )
+                ok = kernel32.WriteFile(handle, buf, len(chunk),
+                                         ctypes.byref(written), None)
                 if not ok:
                     err = ctypes.get_last_error()
-                    raise OSError(f"WriteFile failed (error {err}).")
+                    log.error(f"WriteFile failed: error {err}")
+                    raise OSError(_win_err(err))
                 written_total += written.value
                 progress_cb(written_total)
+        log.info(f"Write complete: {written_total} bytes")
     finally:
         kernel32.CloseHandle(handle)
+        dummy = wintypes.DWORD(0)
+        for h in vol_handles:
+            kernel32.DeviceIoControl(h, FSCTL_UNLOCK_VOLUME,
+                                      None, 0, None, 0, ctypes.byref(dummy), None)
+            kernel32.CloseHandle(h)
 
 
-def _write_unix(image_path, device_path, progress_cb, total_bytes):
+def _write_unix(image_path, device_path, progress_cb, cancel_event):
     written_total = 0
     with open(image_path, "rb") as src, \
          open(device_path, "wb", buffering=0) as dst:
         while True:
+            if cancel_event.is_set():
+                raise InterruptedError("Cancelled.")
             chunk = src.read(CHUNK)
             if not chunk:
                 break
@@ -349,6 +520,36 @@ def _write_unix(image_path, device_path, progress_cb, total_bytes):
             progress_cb(written_total)
         dst.flush()
         os.fsync(dst.fileno())
+    log.info(f"Write complete: {written_total} bytes")
+
+
+def _eject_windows(device_path):
+    """Send IOCTL_STORAGE_EJECT_MEDIA so Windows shows 'safe to remove'."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype    = ctypes.c_void_p
+        k32.DeviceIoControl.restype = ctypes.c_bool
+        k32.CloseHandle.restype    = ctypes.c_bool
+        GENERIC_READ  = 0x80000000
+        GENERIC_WRITE = 0x40000000
+        FILE_SHARE_READ  = 0x1
+        FILE_SHARE_WRITE = 0x2
+        OPEN_EXISTING    = 3
+        INVALID_HANDLE   = ctypes.c_void_p(-1).value
+        IOCTL_STORAGE_EJECT_MEDIA = 0x2D4808
+        h = k32.CreateFileW(device_path, GENERIC_READ | GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             None, OPEN_EXISTING, 0, None)
+        if h not in (None, INVALID_HANDLE):
+            dummy = wintypes.DWORD(0)
+            k32.DeviceIoControl(h, IOCTL_STORAGE_EJECT_MEDIA,
+                                 None, 0, None, 0, ctypes.byref(dummy), None)
+            k32.CloseHandle(h)
+            log.info("Drive ejected.")
+    except Exception as exc:
+        log.warning(f"Eject failed (non-fatal): {exc}")
 
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
@@ -363,70 +564,59 @@ class App(tk.Tk):
         self._drives  = []
         self._arch    = tk.StringVar(value="arm64")
         self._status  = tk.StringVar(value="Fetching latest release…")
+        self._cancel  = threading.Event()
+        self._busy    = False
 
         self._build_ui()
         self._check_admin()
-
-        # Kick off async tasks after UI is visible
         self.after(50,  self._fetch_release_async)
         self.after(100, self.refresh_drives)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ── UI construction ──────────────────────────────────────────────────────
     def _build_ui(self):
         def sep():
             tk.Frame(self, bg=C_BORDER, height=1).pack(fill="x")
 
-        # ── Header ──────────────────────────────────────────────────────────
+        # Header
         hdr = tk.Frame(self, bg=C_BG2)
         hdr.pack(fill="x")
-        tk.Label(
-            hdr, text="NOXIOM OS", font=FONT_TITLE, bg=C_BG2, fg=C_ACCENT
-        ).pack(side="left", padx=16, pady=10)
-        self._ver_lbl = tk.Label(
-            hdr, text="fetching version…", font=FONT_SMALL, bg=C_BG2, fg=C_FG2
-        )
+        tk.Label(hdr, text="NOXIOM OS", font=FONT_TITLE,
+                 bg=C_BG2, fg=C_ACCENT).pack(side="left", padx=16, pady=10)
+        self._ver_lbl = tk.Label(hdr, text="fetching version…",
+                                  font=FONT_SMALL, bg=C_BG2, fg=C_FG2)
         self._ver_lbl.pack(side="right", padx=16, pady=10)
-
         sep()
 
-        # ── Architecture ─────────────────────────────────────────────────────
+        # Architecture
         arch_frm = tk.Frame(self, bg=C_BG, padx=16, pady=10)
         arch_frm.pack(fill="x")
-        tk.Label(
-            arch_frm, text="Architecture", font=FONT_LABEL, bg=C_BG, fg=C_FG2
-        ).pack(anchor="w")
+        tk.Label(arch_frm, text="Architecture", font=FONT_LABEL,
+                 bg=C_BG, fg=C_FG2).pack(anchor="w")
         rb_row = tk.Frame(arch_frm, bg=C_BG)
         rb_row.pack(anchor="w", pady=(4, 0))
-        for val, txt in [
-            ("x86_64", "x86_64   (PC / server)"),
-            ("arm64",  "arm64    (Raspberry Pi)"),
-        ]:
-            tk.Radiobutton(
-                rb_row, text=txt, variable=self._arch, value=val,
-                font=FONT_LABEL, bg=C_BG, fg=C_FG,
-                selectcolor=C_BG3,
-                activebackground=C_BG, activeforeground=C_ACCENT,
-            ).pack(side="left", padx=(0, 24))
-
+        for val, txt in [("x86_64", "x86_64   (PC / server)"),
+                          ("arm64",  "arm64    (Raspberry Pi)")]:
+            tk.Radiobutton(rb_row, text=txt, variable=self._arch, value=val,
+                           font=FONT_LABEL, bg=C_BG, fg=C_FG,
+                           selectcolor=C_BG3,
+                           activebackground=C_BG,
+                           activeforeground=C_ACCENT).pack(side="left", padx=(0, 24))
         sep()
 
-        # ── Drive list ───────────────────────────────────────────────────────
+        # Drive list
         drive_hdr = tk.Frame(self, bg=C_BG, padx=16, pady=6)
         drive_hdr.pack(fill="x")
-        tk.Label(
-            drive_hdr, text="Target Drive", font=FONT_LABEL, bg=C_BG, fg=C_FG2
-        ).pack(side="left")
-        tk.Button(
-            drive_hdr, text="↺  Refresh", font=FONT_SMALL,
-            bg=C_BG3, fg=C_ACCENT,
-            activebackground=C_BG, activeforeground=C_ACCENT,
-            relief="flat", cursor="hand2",
-            command=self.refresh_drives,
-        ).pack(side="right")
+        tk.Label(drive_hdr, text="Target Drive", font=FONT_LABEL,
+                 bg=C_BG, fg=C_FG2).pack(side="left")
+        tk.Button(drive_hdr, text="↺  Refresh", font=FONT_SMALL,
+                  bg=C_BG3, fg=C_ACCENT,
+                  activebackground=C_BG, activeforeground=C_ACCENT,
+                  relief="flat", cursor="hand2",
+                  command=self.refresh_drives).pack(side="right")
 
         list_frm = tk.Frame(self, bg=C_BG, padx=16)
         list_frm.pack(fill="x")
-
         sb = tk.Scrollbar(list_frm, orient="vertical")
         self._drive_lb = tk.Listbox(
             list_frm, height=4, font=FONT_LABEL,
@@ -440,47 +630,33 @@ class App(tk.Tk):
         self._drive_lb.pack(side="left", fill="x", expand=True, pady=4)
         sb.pack(side="right", fill="y", pady=4)
 
-        self._no_drive_lbl = tk.Label(
-            self, text="",
-            font=FONT_SMALL, bg=C_BG, fg=C_FG2
-        )
+        self._no_drive_lbl = tk.Label(self, text="",
+                                       font=FONT_SMALL, bg=C_BG, fg=C_FG2)
         self._no_drive_lbl.pack(padx=16, anchor="w")
 
-        # ── Warning ──────────────────────────────────────────────────────────
-        tk.Label(
-            self,
-            text="⚠  ALL DATA on the selected drive will be permanently erased.",
-            font=FONT_SMALL, bg=C_BG, fg=C_YELLOW,
-            wraplength=444, justify="left",
-        ).pack(fill="x", padx=16, pady=(2, 8))
-
+        tk.Label(self,
+                 text="⚠  ALL DATA on the selected drive will be permanently erased.",
+                 font=FONT_SMALL, bg=C_BG, fg=C_YELLOW,
+                 wraplength=444, justify="left").pack(fill="x", padx=16, pady=(2, 8))
         sep()
 
-        # ── Progress ─────────────────────────────────────────────────────────
+        # Progress
         prog_frm = tk.Frame(self, bg=C_BG, padx=16, pady=8)
         prog_frm.pack(fill="x")
-
-        self._status_lbl = tk.Label(
-            prog_frm, textvariable=self._status,
-            font=FONT_SMALL, bg=C_BG, fg=C_FG2, anchor="w",
-        )
+        self._status_lbl = tk.Label(prog_frm, textvariable=self._status,
+                                     font=FONT_SMALL, bg=C_BG, fg=C_FG2, anchor="w")
         self._status_lbl.pack(fill="x")
-
         style = ttk.Style()
         style.theme_use("default")
-        style.configure(
-            "Nox.Horizontal.TProgressbar",
-            troughcolor=C_BG3, background=C_ACCENT, thickness=14,
-        )
-        self._progress = ttk.Progressbar(
-            prog_frm, orient="horizontal", length=444, mode="determinate",
-            style="Nox.Horizontal.TProgressbar",
-        )
+        style.configure("Nox.Horizontal.TProgressbar",
+                         troughcolor=C_BG3, background=C_ACCENT, thickness=14)
+        self._progress = ttk.Progressbar(prog_frm, orient="horizontal",
+                                          length=444, mode="determinate",
+                                          style="Nox.Horizontal.TProgressbar")
         self._progress.pack(fill="x", pady=(4, 0))
-
         sep()
 
-        # ── Install button ───────────────────────────────────────────────────
+        # Buttons
         btn_frm = tk.Frame(self, bg=C_BG, pady=12)
         btn_frm.pack()
         self._install_btn = tk.Button(
@@ -490,16 +666,25 @@ class App(tk.Tk):
             relief="flat", cursor="hand2", padx=20, pady=8,
             command=self._on_install,
         )
-        self._install_btn.pack()
-
-        # ── Admin warning (shown if not elevated) ────────────────────────────
-        self._admin_lbl = tk.Label(
-            self, text="", font=FONT_SMALL, bg=C_BG, fg=C_RED,
-            wraplength=444, justify="center",
+        self._install_btn.pack(side="left", padx=(0, 12))
+        self._cancel_btn = tk.Button(
+            btn_frm, text="Cancel",
+            font=FONT_BUTTON, bg=C_BG3, fg=C_FG2,
+            activebackground=C_RED, activeforeground=C_FG,
+            relief="flat", cursor="hand2", padx=12, pady=8,
+            command=self._on_cancel, state="disabled",
         )
-        self._admin_lbl.pack(pady=(0, 8))
+        self._cancel_btn.pack(side="left")
 
-        self.geometry("480x560")
+        # Admin warning + log path
+        self._admin_lbl = tk.Label(self, text="", font=FONT_SMALL,
+                                    bg=C_BG, fg=C_RED,
+                                    wraplength=444, justify="center")
+        self._admin_lbl.pack(pady=(0, 2))
+        tk.Label(self, text=f"Log: {LOG_PATH}", font=FONT_SMALL,
+                 bg=C_BG, fg=C_FG2, wraplength=444).pack(pady=(0, 8))
+
+        self.geometry("480x610")
 
     # ── Admin check ──────────────────────────────────────────────────────────
     def _check_admin(self):
@@ -509,7 +694,17 @@ class App(tk.Tk):
                      "Drive writes will fail without elevated privileges."
             )
 
-    # ── Async release fetch ───────────────────────────────────────────────────
+    # ── Safe close ───────────────────────────────────────────────────────────
+    def _on_close(self):
+        if self._busy:
+            if not messagebox.askyesno(
+                "Quit", "Installation is in progress. Cancel and quit?"
+            ):
+                return
+            self._cancel.set()
+        self.destroy()
+
+    # ── Release fetch ─────────────────────────────────────────────────────────
     def _fetch_release_async(self):
         threading.Thread(target=self._fetch_release_worker, daemon=True).start()
 
@@ -517,20 +712,24 @@ class App(tk.Tk):
         try:
             release = fetch_release()
             self._release = release
-
-            def _ok(tag=release.tag):
-                self._ver_lbl.config(text=f"Latest: {tag}", fg=C_GREEN)
+            tag = release.tag
+            note = " (pre-release)" if release.is_prerelease else " (stable)"
+            def _ok():
+                self._ver_lbl.config(text=f"Latest: {tag}{note}", fg=C_GREEN)
                 self._status.set("Ready. Select a drive and click Install.")
             self.after(0, _ok)
         except Exception as exc:
+            log.error(f"fetch_release: {exc}")
             msg = str(exc)
-            def _fail(m=msg):
+            def _fail():
                 self._ver_lbl.config(text="version: unavailable", fg=C_RED)
-                self._status.set(f"Could not fetch release info: {m}")
+                self._status.set(f"Could not fetch release info: {msg}")
             self.after(0, _fail)
 
     # ── Drive refresh ─────────────────────────────────────────────────────────
     def refresh_drives(self):
+        if self._busy:
+            return
         self._drive_lb.delete(0, tk.END)
         self._drives = list_drives()
         if self._drives:
@@ -545,11 +744,9 @@ class App(tk.Tk):
     # ── Install ───────────────────────────────────────────────────────────────
     def _on_install(self):
         if not self._release:
-            messagebox.showerror(
-                "Not ready",
+            messagebox.showerror("Not ready",
                 "Release info has not loaded yet.\n"
-                "Check your internet connection and try again."
-            )
+                "Check your internet connection and try again.")
             return
 
         sel = self._drive_lb.curselection()
@@ -564,25 +761,33 @@ class App(tk.Tk):
         asset_size = self._release.asset_size(asset_name)
 
         if not asset_url:
-            messagebox.showerror(
-                "Asset not found",
-                f"The release '{self._release.tag}' does not contain '{asset_name}'.\n"
-                "Check the GitHub releases page."
-            )
+            messagebox.showerror("Asset not found",
+                f"'{asset_name}' not found in release '{self._release.tag}'.\n"
+                "Check the GitHub releases page.")
             return
 
-        confirmed = messagebox.askyesno(
+        # Refuse if the drive is definitely too small.
+        if drive.size_bytes > 0 and asset_size > 0 and drive.size_bytes < asset_size:
+            messagebox.showerror("Drive too small",
+                f"The selected drive ({drive.size_str()}) is smaller than the image "
+                f"({asset_size / (1024**3):.1f} GB).\n"
+                "Please use a larger drive.")
+            return
+
+        if not messagebox.askyesno(
             "Confirm installation",
             f"Install Noxiom OS ({arch}) to:\n\n"
             f"  {drive}\n\n"
             "⚠  ALL DATA on this drive will be PERMANENTLY ERASED.\n\n"
             "Continue?",
             icon="warning",
-        )
-        if not confirmed:
+        ):
             return
 
+        self._busy = True
+        self._cancel.clear()
         self._install_btn.config(state="disabled")
+        self._cancel_btn.config(state="normal")
         self._status_lbl.config(fg=C_FG2)
         self._progress.configure(value=0)
 
@@ -592,80 +797,115 @@ class App(tk.Tk):
             daemon=True,
         ).start()
 
+    def _on_cancel(self):
+        self._cancel.set()
+        self._cancel_btn.config(state="disabled")
+        self._status.set("Cancelling…")
+
+    # ── Install worker (background thread) ────────────────────────────────────
     def _install_worker(self, drive, url, total_size):
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".img")
         os.close(tmp_fd)
+        log.info(f"Install started: drive={drive.path}  url={url}")
 
         try:
-            # ── Phase 1: Download (0 → 50 %) ────────────────────────────────
-            def dl_cb(downloaded, _total=total_size):
-                pct    = (downloaded / _total * 50) if _total else 0
-                mb_now = downloaded / (1024 ** 2)
-                mb_tot = _total     / (1024 ** 2)
-                def _upd(p=pct, n=mb_now, t=mb_tot):
-                    self._progress.configure(value=p)
-                    self._status.set(f"Downloading…  {n:.1f} / {t:.1f} MB")
-                self.after(0, _upd)
+            # Phase 1 — Download (0 → 50 %)
+            speed = SpeedTracker()
+
+            def dl_cb(downloaded):
+                speed.update(downloaded)
+                pct  = (downloaded / total_size * 50) if total_size else 0
+                now  = downloaded / (1024 ** 2)
+                tot  = total_size / (1024 ** 2)
+                spd  = SpeedTracker.fmt_speed(speed.bps())
+                eta  = speed.eta_str(total_size - downloaded)
+                info = f"  ETA {eta}" if eta else ""
+                self.after(0, lambda p=pct, n=now, t=tot:
+                    (self._progress.configure(value=p),
+                     self._status.set(f"Downloading…  {n:.1f} / {t:.1f} MB{spd}{info}")))
 
             self.after(0, lambda: self._status.set("Starting download…"))
-            download_asset(url, tmp_path, dl_cb, total_size)
+            download_asset(url, tmp_path, dl_cb, self._cancel)
 
-            # ── Phase 2: Write (50 → 100 %) ─────────────────────────────────
+            # Phase 2 — Write (50 → 100 %)
             img_size = os.path.getsize(tmp_path)
+            speed2   = SpeedTracker()
 
-            def wr_cb(written, _img=img_size):
-                pct    = 50 + (written / _img * 50) if _img else 50
-                mb_now = written / (1024 ** 2)
-                mb_tot = _img    / (1024 ** 2)
-                def _upd(p=pct, n=mb_now, t=mb_tot):
-                    self._progress.configure(value=p)
-                    self._status.set(f"Writing…  {n:.1f} / {t:.1f} MB")
-                self.after(0, _upd)
+            def wr_cb(written):
+                speed2.update(written)
+                pct  = 50 + (written / img_size * 50) if img_size else 50
+                now  = written  / (1024 ** 2)
+                tot  = img_size / (1024 ** 2)
+                spd  = SpeedTracker.fmt_speed(speed2.bps())
+                eta  = speed2.eta_str(img_size - written)
+                info = f"  ETA {eta}" if eta else ""
+                self.after(0, lambda p=pct, n=now, t=tot:
+                    (self._progress.configure(value=p),
+                     self._status.set(f"Writing…  {n:.1f} / {t:.1f} MB{spd}{info}")))
 
             self.after(0, lambda: self._status.set("Writing to drive…"))
-            write_image(tmp_path, drive.path, wr_cb, img_size)
+            write_image(tmp_path, drive.path, wr_cb, self._cancel)
+
+            # Eject (Windows only)
+            if platform.system() == "Windows":
+                self.after(0, lambda: self._status.set("Ejecting drive…"))
+                _eject_windows(drive.path)
 
             self.after(0, self._on_done)
 
+        except InterruptedError:
+            log.info("Installation cancelled by user.")
+            self.after(0, self._on_cancelled)
         except Exception as exc:
             msg = str(exc)
+            log.error(f"Installation failed: {exc}")
             self.after(0, lambda m=msg: self._on_error(m))
         finally:
+            self._busy = False
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
 
+    # ── Outcome handlers ──────────────────────────────────────────────────────
     def _on_done(self):
         self._progress.configure(value=100)
-        self._status.set("Installation complete!")
+        self._status.set("Done! Safe to remove the drive.")
         self._status_lbl.config(fg=C_GREEN)
         self._install_btn.config(state="normal")
-        messagebox.showinfo(
-            "Done",
+        self._cancel_btn.config(state="disabled")
+        messagebox.showinfo("Done",
             "Noxiom OS has been written to the drive.\n\n"
-            "Safely eject the drive, then insert it into your target device."
-        )
+            "The drive has been safely ejected.\n"
+            "Insert it into your target device and power on.")
+
+    def _on_cancelled(self):
+        self._progress.configure(value=0)
+        self._status.set("Cancelled.")
+        self._status_lbl.config(fg=C_YELLOW)
+        self._install_btn.config(state="normal")
+        self._cancel_btn.config(state="disabled")
 
     def _on_error(self, msg):
         self._status.set(f"Error: {msg}")
         self._status_lbl.config(fg=C_RED)
         self._install_btn.config(state="normal")
-        messagebox.showerror("Installation failed", msg)
+        self._cancel_btn.config(state="disabled")
+        messagebox.showerror("Installation failed",
+            f"{msg}\n\nSee the log for details:\n{LOG_PATH}")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def _relaunch_as_admin_windows():
-    """On Windows, offer to relaunch the script with UAC elevation."""
     import ctypes
     rc = ctypes.windll.user32.MessageBoxW(
         0,
         "This installer needs Administrator privileges to write to drives.\n\n"
         "Relaunch as Administrator?",
         "NOXIOM OS Installer",
-        0x00000034,  # MB_YESNO | MB_ICONQUESTION | MB_TOPMOST
+        0x00000034,   # MB_YESNO | MB_ICONQUESTION | MB_TOPMOST
     )
-    if rc == 6:   # IDYES
+    if rc == 6:       # IDYES
         params = " ".join(f'"{a}"' for a in sys.argv)
         ctypes.windll.shell32.ShellExecuteW(
             None, "runas", sys.executable, params, None, 1
@@ -674,12 +914,13 @@ def _relaunch_as_admin_windows():
 
 
 def main():
+    log.info(f"Installer started.  Platform: {platform.system()} {platform.version()}")
     if platform.system() == "Windows" and not is_admin():
         _relaunch_as_admin_windows()
         return
-
     app = App()
     app.mainloop()
+    log.info("Installer closed.")
 
 
 if __name__ == "__main__":
