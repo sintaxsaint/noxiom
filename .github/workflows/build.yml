@@ -93,7 +93,7 @@ jobs:
           cp_fat noxiom/build/arm64/kernel8.img    kernel8.img
           # Pi 5 looks for kernel_2712.img first — provide same binary under that name
           cp_fat noxiom/build/arm64/kernel8.img    kernel_2712.img
-          cp_fat noxiom/noxiom/arch/arm64/boot/config.txt  config.txt
+          cp_fat noxiom/arch/arm64/boot/config.txt  config.txt
 
           echo "arm64 image partition contents:"
           MTOOLSRC=/tmp/mtoolsrc mdir -i imgs/noxiom-arm64.img@@$OFFSET
