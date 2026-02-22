@@ -318,6 +318,10 @@ def _write_windows(image_path, device_path, progress_cb, total_bytes):
                 chunk = f.read(CHUNK)
                 if not chunk:
                     break
+                # Windows raw drive writes must be exact multiples of 512 bytes.
+                # Pad the last chunk to the next sector boundary if needed.
+                if len(chunk) % 512 != 0:
+                    chunk = chunk + b'\x00' * (512 - len(chunk) % 512)
                 ctypes.memmove(buf, chunk, len(chunk))
                 written = wintypes.DWORD(0)
                 ok = kernel32.WriteFile(
