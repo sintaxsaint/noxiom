@@ -139,6 +139,50 @@ def list_drives():
     return []
 
 
+def _disk_size_windows(disk_num):
+    """
+    Query the actual size of PhysicalDriveN via IOCTL_DISK_GET_LENGTH_INFO.
+    Used as a fallback when Get-Disk returns 0 (common for USB card readers
+    where the reader itself has no storage — the inserted media does).
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype    = ctypes.c_void_p
+        k32.DeviceIoControl.restype = ctypes.c_bool
+        k32.CloseHandle.restype    = ctypes.c_bool
+        GENERIC_READ     = 0x80000000
+        FILE_SHARE_READ  = 0x1
+        FILE_SHARE_WRITE = 0x2
+        OPEN_EXISTING    = 3
+        INVALID_HANDLE   = ctypes.c_void_p(-1).value
+        IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
+
+        class GET_LENGTH_INFORMATION(ctypes.Structure):
+            _fields_ = [("Length", ctypes.c_int64)]
+
+        h = k32.CreateFileW(
+            f"\\\\.\\PhysicalDrive{disk_num}",
+            GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None, OPEN_EXISTING, 0, None,
+        )
+        if h == INVALID_HANDLE or h is None:
+            return 0
+        gli = GET_LENGTH_INFORMATION()
+        br  = wintypes.DWORD(0)
+        ok  = k32.DeviceIoControl(
+            h, IOCTL_DISK_GET_LENGTH_INFO,
+            None, 0, ctypes.byref(gli), ctypes.sizeof(gli),
+            ctypes.byref(br), None,
+        )
+        k32.CloseHandle(h)
+        return int(gli.Length) if ok else 0
+    except Exception as exc:
+        log.debug(f"Size query for disk {disk_num} failed: {exc}")
+        return 0
+
+
 def _drives_windows():
     ps = (
         "Get-Disk | Where-Object {$_.BusType -in @('USB','SD','MMC')} | "
@@ -166,6 +210,11 @@ def _drives_windows():
         num  = d.get("Number", 0)
         name = d.get("FriendlyName") or f"Disk {num}"
         size = int(d.get("Size") or 0)
+        # Get-Disk returns 0 for card readers that report the reader hardware,
+        # not the inserted media.  Fall back to a direct IOCTL query.
+        if size == 0:
+            size = _disk_size_windows(num)
+            log.debug(f"Disk {num} size from IOCTL: {size}")
         bus  = (d.get("BusType") or "USB").upper()
         drives.append(Drive(f"\\\\.\\PhysicalDrive{num}", name, bus, size))
     log.debug(f"Windows drives: {[str(d) for d in drives]}")
@@ -376,8 +425,11 @@ def _write_windows(image_path, device_path, progress_cb, cancel_event):
     kernel32.CloseHandle.restype       = ctypes.c_bool
     kernel32.DeviceIoControl.restype   = ctypes.c_bool
     kernel32.FindFirstVolumeW.restype  = ctypes.c_void_p
+    kernel32.FindFirstVolumeW.argtypes = [ctypes.c_wchar_p, wintypes.DWORD]
     kernel32.FindNextVolumeW.restype   = ctypes.c_bool
+    kernel32.FindNextVolumeW.argtypes  = [ctypes.c_void_p, ctypes.c_wchar_p, wintypes.DWORD]
     kernel32.FindVolumeClose.restype   = ctypes.c_bool
+    kernel32.FindVolumeClose.argtypes  = [ctypes.c_void_p]
 
     GENERIC_READ             = 0x80000000
     GENERIC_WRITE            = 0x40000000
