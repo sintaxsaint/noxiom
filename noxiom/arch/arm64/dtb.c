@@ -149,7 +149,6 @@ int dtb_parse(uint64_t dtb_phys_addr, dtb_result_t *out)
     /* Walk state */
     const uint8_t *p = struct_block;
     int depth = 0;
-    char node_path[256] = "";  /* current node name stack (simplified) */
     char cur_node[64] = "";
 
     /* Flags to track what we found at the current node */

@@ -41,9 +41,6 @@ static volatile uint8_t *gicc = 0;
 static void gicd_w32(uint32_t off, uint32_t val) {
     *((volatile uint32_t *)(gicd + off)) = val;
 }
-static uint32_t gicd_r32(uint32_t off) {
-    return *((volatile uint32_t *)(gicd + off));
-}
 static void gicc_w32(uint32_t off, uint32_t val) {
     *((volatile uint32_t *)(gicc + off)) = val;
 }

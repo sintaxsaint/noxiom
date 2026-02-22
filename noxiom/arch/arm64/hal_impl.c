@@ -146,3 +146,24 @@ void hal_hw_detect(void)
     kstrncpy(g_hw_info.compat_str, s_dtb.uart_compat,
              sizeof(g_hw_info.compat_str) - 1);
 }
+
+/* ── Exception handlers (called from exceptions.S with sp as arg) ───────── */
+
+/* Synchronous exception (data abort, instruction abort, etc.)
+ * These are fatal at this stage — halt the CPU. */
+void arm64_sync_handler(void *frame)
+{
+    (void)frame;
+    hal_serial_print("\r\n[NOXIOM] FATAL: synchronous exception\r\n");
+    hal_halt();
+}
+
+/* IRQ handler — acknowledge and signal end-of-interrupt to the GIC. */
+void arm64_irq_handler(void *frame)
+{
+    (void)frame;
+    uint32_t irq = gic_ack();
+    /* No specific IRQ handlers yet; just acknowledge and move on. */
+    if (irq < 1020)   /* 1020-1023 are spurious — don't EOI them */
+        gic_eoi(irq);
+}
