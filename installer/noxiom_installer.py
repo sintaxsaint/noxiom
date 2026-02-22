@@ -475,6 +475,48 @@ def _setup_k32():
     return k
 
 
+def _ps_disk_offline(disk_num):
+    """
+    Use PowerShell Set-Disk to take ALL volumes on disk_num offline at once.
+    This is the most reliable method because it handles every filesystem type,
+    including Linux ext4/btrfs partitions that Windows can't open for writing.
+    Returns True if the disk was successfully taken offline.
+    """
+    if disk_num < 0:
+        return False
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             f"Set-Disk -Number {disk_num} -IsOffline $true"],
+            capture_output=True, timeout=15,
+        )
+        ok = result.returncode == 0
+        if not ok:
+            log.debug(f"Set-Disk offline stderr: "
+                      f"{result.stderr.decode(errors='replace').strip()}")
+        log.debug(f"PowerShell Set-Disk offline: disk={disk_num} ok={ok}")
+        return ok
+    except Exception as exc:
+        log.debug(f"PowerShell Set-Disk offline failed: {exc}")
+        return False
+
+
+def _ps_disk_online(disk_num):
+    """Bring a disk back online after a failed write (cleanup path)."""
+    if disk_num < 0:
+        return
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             f"Set-Disk -Number {disk_num} -IsOffline $false; "
+             f"Set-Disk -Number {disk_num} -IsReadOnly $false"],
+            capture_output=True, timeout=15,
+        )
+        log.debug(f"PowerShell Set-Disk online: disk={disk_num}")
+    except Exception as exc:
+        log.debug(f"PowerShell Set-Disk online failed (non-fatal): {exc}")
+
+
 def _write_windows(image_path, device_path, progress_cb, cancel_event):
     import ctypes
     from ctypes import wintypes
@@ -532,37 +574,51 @@ def _write_windows(image_path, device_path, progress_cb, cancel_event):
         disk_num = -1
     log.debug(f"Target disk number: {disk_num}")
 
-    # Enumerate ALL volumes via FindFirstVolumeW so drives with no assigned
-    # drive letter (freshly inserted SD cards) are still caught.
-    vol_paths = []
-    if disk_num >= 0:
-        name_buf = ctypes.create_unicode_buffer(260)
-        hf = k32.FindFirstVolumeW(name_buf, 260)
-        if hf not in (None, INVALID_HANDLE):
-            while True:
-                if _vol_disk_num(name_buf.value) == disk_num:
-                    vol_paths.append(name_buf.value)
-                if not k32.FindNextVolumeW(hf, name_buf, 260):
-                    break
-            k32.FindVolumeClose(hf)
-    log.debug(f"Volumes on disk {disk_num}: {vol_paths}")
+    # ── Primary: PowerShell Set-Disk offline ─────────────────────────────────
+    # This takes ALL volumes offline in one call, including Linux ext4/btrfs
+    # partitions that Windows can't open with write access individually.
+    ps_offline = _ps_disk_offline(disk_num)
 
-    # Lock + dismount every volume so the filesystem driver releases the device.
-    # Dismount is attempted even if lock fails (forced dismount).
+    # ── Secondary: per-volume lock + dismount ─────────────────────────────────
+    # Belt-and-suspenders fallback if Set-Disk isn't supported for this drive
+    # type (some older USB readers return "not supported").
     vol_handles = []
-    for vp in vol_paths:
-        h = k32.CreateFileW(
-            vp.rstrip("\\"), GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            None, OPEN_EXISTING, 0, None,
-        )
-        if h in (INVALID_HANDLE, None):
-            log.debug(f"Could not open {vp} for locking (ignored)")
-            continue
-        ok_l = _ioctl(h, FSCTL_LOCK_VOLUME)
-        ok_d = _ioctl(h, FSCTL_DISMOUNT_VOLUME)
-        log.debug(f"  {vp}: lock={ok_l} dismount={ok_d}")
-        vol_handles.append(h)
+    if not ps_offline:
+        vol_paths = []
+        if disk_num >= 0:
+            name_buf = ctypes.create_unicode_buffer(260)
+            hf = k32.FindFirstVolumeW(name_buf, 260)
+            if hf not in (None, INVALID_HANDLE):
+                while True:
+                    if _vol_disk_num(name_buf.value) == disk_num:
+                        vol_paths.append(name_buf.value)
+                    if not k32.FindNextVolumeW(hf, name_buf, 260):
+                        break
+                k32.FindVolumeClose(hf)
+        log.debug(f"Volumes on disk {disk_num}: {vol_paths}")
+
+        for vp in vol_paths:
+            # Try GENERIC_READ|GENERIC_WRITE first (full lock).
+            # Fall back to GENERIC_READ for volumes with unrecognised
+            # filesystems (ext4, btrfs, etc.) — Windows allows read-only
+            # access even when it can't write the filesystem.
+            h = None
+            for access in [GENERIC_READ | GENERIC_WRITE, GENERIC_READ]:
+                tmp = k32.CreateFileW(
+                    vp.rstrip("\\"), access,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    None, OPEN_EXISTING, 0, None,
+                )
+                if tmp not in (INVALID_HANDLE, None):
+                    h = tmp
+                    break
+            if h is None:
+                log.debug(f"Could not open {vp} at any access level (skipped)")
+                continue
+            ok_l = _ioctl(h, FSCTL_LOCK_VOLUME)
+            ok_d = _ioctl(h, FSCTL_DISMOUNT_VOLUME)
+            log.debug(f"  {vp}: lock={ok_l} dismount={ok_d}")
+            vol_handles.append(h)
 
     # Open physical drive for writing.
     handle = k32.CreateFileW(
@@ -573,11 +629,14 @@ def _write_windows(image_path, device_path, progress_cb, cancel_event):
     if handle == INVALID_HANDLE or handle is None:
         for h in vol_handles:
             k32.CloseHandle(h)
+        if ps_offline:
+            _ps_disk_online(disk_num)
         err = ctypes.get_last_error()
         log.error(f"CreateFileW({device_path}) failed: error {err}")
         raise OSError(_win_err(err))
 
     written_total = 0
+    write_ok = False
     try:
         io_buf = (ctypes.c_char * CHUNK)()
         with open(image_path, "rb") as f:
@@ -600,12 +659,17 @@ def _write_windows(image_path, device_path, progress_cb, cancel_event):
                     raise OSError(_win_err(err))
                 written_total += written.value
                 progress_cb(written_total)
+        write_ok = True
         log.info(f"Write complete: {written_total} bytes")
     finally:
         k32.CloseHandle(handle)
         for h in vol_handles:
             _ioctl(h, FSCTL_UNLOCK_VOLUME)
             k32.CloseHandle(h)
+        # If we took the disk offline and the write failed, bring it back so
+        # the user doesn't end up with a stuck-offline drive.
+        if ps_offline and not write_ok:
+            _ps_disk_online(disk_num)
 
 
 def _write_unix(image_path, device_path, progress_cb, cancel_event):
