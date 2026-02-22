@@ -530,10 +530,13 @@ def _write_windows(image_path, device_path, progress_cb, cancel_event):
     FILE_SHARE_WRITE         = 0x00000002
     OPEN_EXISTING            = 3
     INVALID_HANDLE           = ctypes.c_void_p(-1).value
+    # FILE_FLAG_NO_BUFFERING + WRITE_THROUGH bypass the Windows cache layer and
+    # write directly to the storage hardware — required for reliable raw disk writes.
+    FILE_FLAG_NO_BUFFERING   = 0x20000000
+    FILE_FLAG_WRITE_THROUGH  = 0x80000000
 
-    FSCTL_LOCK_VOLUME               = 0x00090018
-    FSCTL_DISMOUNT_VOLUME           = 0x00090020
-    FSCTL_UNLOCK_VOLUME             = 0x0009001C
+    FSCTL_LOCK_VOLUME    = 0x00090018
+    FSCTL_DISMOUNT_VOLUME = 0x00090020
 
     def _ioctl(h, code, out_buf=None, out_size=0):
         br = wintypes.DWORD(0)
@@ -552,19 +555,17 @@ def _write_windows(image_path, device_path, progress_cb, cancel_event):
     log.debug(f"Target disk number: {disk_num}")
 
     # ── Primary: PowerShell Set-Disk offline ─────────────────────────────────
-    # This takes ALL volumes offline in one call, including Linux ext4/btrfs
-    # partitions that Windows can't open with write access individually.
+    # Takes ALL volumes offline in one call (handles ext4/btrfs too).
+    # Fails for USB removable media ("Removable media cannot be set to offline").
     ps_offline = _ps_disk_offline(disk_num)
 
     # ── Secondary: per-partition lock + dismount ──────────────────────────────
-    # Belt-and-suspenders fallback if Set-Disk isn't supported for this drive.
+    # Uses \\.\HarddiskNPartitionM — works for ALL filesystem types including
+    # Linux ext4/btrfs (unlike FindFirstVolumeW which only finds FAT/NTFS).
     #
-    # IMPORTANT: We use \\.\HarddiskNPartitionM paths here, NOT FindFirstVolumeW.
-    # FindFirstVolumeW only returns Volume GUIDs for partitions Windows *recognises*
-    # (FAT32, NTFS, ReFS). Linux ext4/btrfs partitions have NO Volume GUID, so they
-    # are invisible to that API. However, they DO get a raw partition device node in
-    # the Windows storage stack (\\.\HarddiskNPartitionM), which we can open and lock.
-    vol_handles = []
+    # CRITICAL: partition handles are CLOSED IMMEDIATELY after dismounting.
+    # Keeping them open while writing to the physical drive causes the Windows
+    # storage stack to return error 483 (conflicting device object access).
     if not ps_offline:
         log.debug("Set-Disk offline unavailable; locking partitions by device path")
         if disk_num >= 0:
@@ -582,27 +583,24 @@ def _write_windows(image_path, device_path, progress_cb, cancel_event):
                         break
                 if h is None:
                     err = ctypes.get_last_error()
-                    # 2=file not found, 3=path not found, 87=invalid param,
-                    # 1168=element not found — all mean the partition does not exist.
                     log.debug(f"  {part_path}: open failed err={err}")
                     if err in (2, 3, 87, 1168):
                         break   # No more partitions on this disk
-                    continue    # Unexpected error; skip this slot and keep going
+                    continue    # Unexpected error; skip this slot
                 ok_l = _ioctl(h, FSCTL_LOCK_VOLUME)
                 ok_d = _ioctl(h, FSCTL_DISMOUNT_VOLUME)
                 log.debug(f"  {part_path}: lock={ok_l} dismount={ok_d}")
-                vol_handles.append(h)
-        log.debug(f"Locked {len(vol_handles)} partitions")
+                k32.CloseHandle(h)   # ← close immediately; lock auto-releases on close
 
-    # Open physical drive for writing.
+    # Open physical drive for direct raw write.
     handle = k32.CreateFileW(
         device_path, GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
-        None, OPEN_EXISTING, 0, None,
+        None, OPEN_EXISTING,
+        FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
+        None,
     )
     if handle == INVALID_HANDLE or handle is None:
-        for h in vol_handles:
-            k32.CloseHandle(h)
         if ps_offline:
             _ps_disk_online(disk_num)
         err = ctypes.get_last_error()
@@ -611,7 +609,15 @@ def _write_windows(image_path, device_path, progress_cb, cancel_event):
 
     written_total = 0
     try:
-        io_buf = (ctypes.c_char * CHUNK)()
+        # FILE_FLAG_NO_BUFFERING requires the buffer to be aligned to the disk's
+        # sector size.  Over-allocate by 4095 bytes so we can find a 4096-byte-
+        # aligned start address inside the allocation (works for both 512-byte
+        # and 4096-byte / "Advanced Format" native-sector drives).
+        _io_raw = (ctypes.c_char * (CHUNK + 4095))()
+        _io_off = (4096 - ctypes.addressof(_io_raw) % 4096) % 4096
+        io_buf  = (ctypes.c_char * CHUNK).from_address(
+            ctypes.addressof(_io_raw) + _io_off
+        )
         with open(image_path, "rb") as f:
             while True:
                 if cancel_event.is_set():
@@ -619,9 +625,10 @@ def _write_windows(image_path, device_path, progress_cb, cancel_event):
                 chunk = f.read(CHUNK)
                 if not chunk:
                     break
-                # Raw drive writes must be exact multiples of 512 bytes.
-                if len(chunk) % 512 != 0:
-                    chunk = chunk + b"\x00" * (512 - len(chunk) % 512)
+                # Write size must be a multiple of the sector size.
+                # 4096 covers both 512-byte and 4K-native drives.
+                if len(chunk) % 4096 != 0:
+                    chunk = chunk + b"\x00" * (4096 - len(chunk) % 4096)
                 ctypes.memmove(io_buf, chunk, len(chunk))
                 written = wintypes.DWORD(0)
                 ok = k32.WriteFile(handle, io_buf, len(chunk),
@@ -635,13 +642,6 @@ def _write_windows(image_path, device_path, progress_cb, cancel_event):
         log.info(f"Write complete: {written_total} bytes")
     finally:
         k32.CloseHandle(handle)
-        for h in vol_handles:
-            _ioctl(h, FSCTL_UNLOCK_VOLUME)
-            k32.CloseHandle(h)
-        # Always bring the disk back online after we're done (success OR failure).
-        # If we leave it offline after a successful write, Windows tries to re-read
-        # the old (now-overwritten) partition table from cache and shows
-        # "cannot read partition 4 and 5" errors.
         if ps_offline:
             _ps_disk_online(disk_num)
 
