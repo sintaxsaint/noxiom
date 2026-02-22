@@ -104,7 +104,34 @@ def is_admin():
     try:
         if platform.system() == "Windows":
             import ctypes
-            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+            import ctypes.wintypes
+            # IsUserAnAdmin() checks group membership on the *original* token and
+            # returns False for elevated processes in some UAC configurations.
+            # GetTokenInformation(TokenElevation) directly checks whether the
+            # current process token is elevated — the correct test on Vista+.
+            TOKEN_QUERY    = 0x0008
+            TokenElevation = 20
+
+            class TOKEN_ELEVATION(ctypes.Structure):
+                _fields_ = [("TokenIsElevated", ctypes.wintypes.DWORD)]
+
+            hproc = ctypes.windll.kernel32.GetCurrentProcess()
+            htok  = ctypes.wintypes.HANDLE()
+            if not ctypes.windll.advapi32.OpenProcessToken(
+                hproc, TOKEN_QUERY, ctypes.byref(htok)
+            ):
+                return bool(ctypes.windll.shell32.IsUserAnAdmin())  # fallback
+
+            elev = TOKEN_ELEVATION()
+            size = ctypes.wintypes.DWORD(ctypes.sizeof(elev))
+            ok   = ctypes.windll.advapi32.GetTokenInformation(
+                htok, TokenElevation,
+                ctypes.byref(elev), ctypes.sizeof(elev), ctypes.byref(size),
+            )
+            ctypes.windll.kernel32.CloseHandle(htok)
+            if ok:
+                return bool(elev.TokenIsElevated)
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())  # fallback
         return os.geteuid() == 0
     except Exception:
         return False
