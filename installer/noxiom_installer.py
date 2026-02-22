@@ -148,15 +148,12 @@ def _disk_size_windows(disk_num):
     try:
         import ctypes
         from ctypes import wintypes
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        k32.CreateFileW.restype    = ctypes.c_void_p
-        k32.DeviceIoControl.restype = ctypes.c_bool
-        k32.CloseHandle.restype    = ctypes.c_bool
-        GENERIC_READ     = 0x80000000
-        FILE_SHARE_READ  = 0x1
-        FILE_SHARE_WRITE = 0x2
-        OPEN_EXISTING    = 3
-        INVALID_HANDLE   = ctypes.c_void_p(-1).value
+        k32 = _setup_k32()
+        GENERIC_READ             = 0x80000000
+        FILE_SHARE_READ          = 0x1
+        FILE_SHARE_WRITE         = 0x2
+        OPEN_EXISTING            = 3
+        INVALID_HANDLE           = ctypes.c_void_p(-1).value
         IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
 
         class GET_LENGTH_INFORMATION(ctypes.Structure):
@@ -415,21 +412,74 @@ def write_image(image_path, device_path, progress_cb, cancel_event):
         _write_unix(image_path, device_path, progress_cb, cancel_event)
 
 
+def _setup_k32():
+    """
+    Return kernel32 with full argtypes + restypes for every function we use.
+
+    Without argtypes, ctypes defaults to passing Python ints as c_int (32-bit).
+    On 64-bit Windows a HANDLE is 64 bits, so large handle values get truncated
+    and every subsequent API call silently operates on a garbage handle.
+    """
+    import ctypes
+    from ctypes import wintypes
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    # HANDLE is void* — use c_void_p so 64-bit values survive the round-trip.
+    H = ctypes.c_void_p
+
+    k.CreateFileW.restype  = H
+    k.CreateFileW.argtypes = [
+        ctypes.c_wchar_p,   # lpFileName
+        wintypes.DWORD,     # dwDesiredAccess
+        wintypes.DWORD,     # dwShareMode
+        H,                  # lpSecurityAttributes (NULL)
+        wintypes.DWORD,     # dwCreationDisposition
+        wintypes.DWORD,     # dwFlagsAndAttributes
+        H,                  # hTemplateFile (NULL)
+    ]
+
+    k.CloseHandle.restype  = ctypes.c_bool
+    k.CloseHandle.argtypes = [H]
+
+    # DeviceIoControl — lpBytesReturned / lpOverlapped can be NULL, so c_void_p
+    k.DeviceIoControl.restype  = ctypes.c_bool
+    k.DeviceIoControl.argtypes = [
+        H,               # hDevice
+        wintypes.DWORD,  # dwIoControlCode
+        H,               # lpInBuffer
+        wintypes.DWORD,  # nInBufferSize
+        H,               # lpOutBuffer
+        wintypes.DWORD,  # nOutBufferSize
+        H,               # lpBytesReturned
+        H,               # lpOverlapped
+    ]
+
+    k.WriteFile.restype  = ctypes.c_bool
+    k.WriteFile.argtypes = [
+        H,               # hFile
+        H,               # lpBuffer
+        wintypes.DWORD,  # nNumberOfBytesToWrite
+        H,               # lpNumberOfBytesWritten
+        H,               # lpOverlapped
+    ]
+
+    k.FindFirstVolumeW.restype  = H
+    k.FindFirstVolumeW.argtypes = [ctypes.c_wchar_p, wintypes.DWORD]
+
+    k.FindNextVolumeW.restype  = ctypes.c_bool
+    k.FindNextVolumeW.argtypes = [H, ctypes.c_wchar_p, wintypes.DWORD]
+
+    k.FindVolumeClose.restype  = ctypes.c_bool
+    k.FindVolumeClose.argtypes = [H]
+
+    return k
+
+
 def _write_windows(image_path, device_path, progress_cb, cancel_event):
     import ctypes
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateFileW.restype       = ctypes.c_void_p
-    kernel32.WriteFile.restype         = ctypes.c_bool
-    kernel32.CloseHandle.restype       = ctypes.c_bool
-    kernel32.DeviceIoControl.restype   = ctypes.c_bool
-    kernel32.FindFirstVolumeW.restype  = ctypes.c_void_p
-    kernel32.FindFirstVolumeW.argtypes = [ctypes.c_wchar_p, wintypes.DWORD]
-    kernel32.FindNextVolumeW.restype   = ctypes.c_bool
-    kernel32.FindNextVolumeW.argtypes  = [ctypes.c_void_p, ctypes.c_wchar_p, wintypes.DWORD]
-    kernel32.FindVolumeClose.restype   = ctypes.c_bool
-    kernel32.FindVolumeClose.argtypes  = [ctypes.c_void_p]
+    k32 = _setup_k32()
 
     GENERIC_READ             = 0x80000000
     GENERIC_WRITE            = 0x40000000
@@ -448,26 +498,31 @@ def _write_windows(image_path, device_path, progress_cb, cancel_event):
                     ("DeviceNumber", wintypes.DWORD),
                     ("PartitionNumber", wintypes.DWORD)]
 
-    def _device_num(h):
-        sdn = STORAGE_DEVICE_NUMBER()
-        br  = wintypes.DWORD(0)
-        ok  = kernel32.DeviceIoControl(
-            h, IOCTL_STORAGE_GET_DEVICE_NUMBER,
-            None, 0, ctypes.byref(sdn), ctypes.sizeof(sdn),
+    def _ioctl(h, code, out_buf=None, out_size=0):
+        br = wintypes.DWORD(0)
+        return k32.DeviceIoControl(
+            h, code,
+            None, 0,
+            out_buf, out_size,
             ctypes.byref(br), None,
         )
+
+    def _device_num(h):
+        sdn = STORAGE_DEVICE_NUMBER()
+        ok  = _ioctl(h, IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                     ctypes.byref(sdn), ctypes.sizeof(sdn))
         return int(sdn.DeviceNumber) if ok else -1
 
     def _vol_disk_num(vol_path):
-        path = vol_path.rstrip("\\")
-        h = kernel32.CreateFileW(
-            path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        h = k32.CreateFileW(
+            vol_path.rstrip("\\"), 0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
             None, OPEN_EXISTING, 0, None,
         )
         if h == INVALID_HANDLE or h is None:
             return -1
         n = _device_num(h)
-        kernel32.CloseHandle(h)
+        k32.CloseHandle(h)
         return n
 
     # Disk number from "\\.\PhysicalDriveN"
@@ -477,56 +532,54 @@ def _write_windows(image_path, device_path, progress_cb, cancel_event):
         disk_num = -1
     log.debug(f"Target disk number: {disk_num}")
 
-    # Enumerate ALL volumes (including those with no drive letter assigned)
-    # using FindFirstVolumeW / FindNextVolumeW so no volume slips through.
+    # Enumerate ALL volumes via FindFirstVolumeW so drives with no assigned
+    # drive letter (freshly inserted SD cards) are still caught.
     vol_paths = []
     if disk_num >= 0:
-        buf = ctypes.create_unicode_buffer(260)
-        hf  = kernel32.FindFirstVolumeW(buf, 260)
+        name_buf = ctypes.create_unicode_buffer(260)
+        hf = k32.FindFirstVolumeW(name_buf, 260)
         if hf not in (None, INVALID_HANDLE):
             while True:
-                if _vol_disk_num(buf.value) == disk_num:
-                    vol_paths.append(buf.value)
-                if not kernel32.FindNextVolumeW(hf, buf, 260):
+                if _vol_disk_num(name_buf.value) == disk_num:
+                    vol_paths.append(name_buf.value)
+                if not k32.FindNextVolumeW(hf, name_buf, 260):
                     break
-            kernel32.FindVolumeClose(hf)
+            k32.FindVolumeClose(hf)
     log.debug(f"Volumes on disk {disk_num}: {vol_paths}")
 
     # Lock + dismount every volume so the filesystem driver releases the device.
+    # Dismount is attempted even if lock fails (forced dismount).
     vol_handles = []
     for vp in vol_paths:
-        h = kernel32.CreateFileW(
+        h = k32.CreateFileW(
             vp.rstrip("\\"), GENERIC_READ | GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None, OPEN_EXISTING, 0, None,
         )
         if h in (INVALID_HANDLE, None):
-            log.debug(f"Could not open {vp} for locking")
+            log.debug(f"Could not open {vp} for locking (ignored)")
             continue
-        dummy = wintypes.DWORD(0)
-        ok_l = kernel32.DeviceIoControl(h, FSCTL_LOCK_VOLUME,
-                                         None, 0, None, 0, ctypes.byref(dummy), None)
-        ok_d = kernel32.DeviceIoControl(h, FSCTL_DISMOUNT_VOLUME,
-                                         None, 0, None, 0, ctypes.byref(dummy), None)
+        ok_l = _ioctl(h, FSCTL_LOCK_VOLUME)
+        ok_d = _ioctl(h, FSCTL_DISMOUNT_VOLUME)
         log.debug(f"  {vp}: lock={ok_l} dismount={ok_d}")
         vol_handles.append(h)
 
     # Open physical drive for writing.
-    handle = kernel32.CreateFileW(
+    handle = k32.CreateFileW(
         device_path, GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         None, OPEN_EXISTING, 0, None,
     )
     if handle == INVALID_HANDLE or handle is None:
         for h in vol_handles:
-            kernel32.CloseHandle(h)
+            k32.CloseHandle(h)
         err = ctypes.get_last_error()
         log.error(f"CreateFileW({device_path}) failed: error {err}")
         raise OSError(_win_err(err))
 
     written_total = 0
     try:
-        buf = (ctypes.c_char * CHUNK)()
+        io_buf = (ctypes.c_char * CHUNK)()
         with open(image_path, "rb") as f:
             while True:
                 if cancel_event.is_set():
@@ -537,10 +590,10 @@ def _write_windows(image_path, device_path, progress_cb, cancel_event):
                 # Raw drive writes must be exact multiples of 512 bytes.
                 if len(chunk) % 512 != 0:
                     chunk = chunk + b"\x00" * (512 - len(chunk) % 512)
-                ctypes.memmove(buf, chunk, len(chunk))
+                ctypes.memmove(io_buf, chunk, len(chunk))
                 written = wintypes.DWORD(0)
-                ok = kernel32.WriteFile(handle, buf, len(chunk),
-                                         ctypes.byref(written), None)
+                ok = k32.WriteFile(handle, io_buf, len(chunk),
+                                    ctypes.byref(written), None)
                 if not ok:
                     err = ctypes.get_last_error()
                     log.error(f"WriteFile failed: error {err}")
@@ -549,12 +602,10 @@ def _write_windows(image_path, device_path, progress_cb, cancel_event):
                 progress_cb(written_total)
         log.info(f"Write complete: {written_total} bytes")
     finally:
-        kernel32.CloseHandle(handle)
-        dummy = wintypes.DWORD(0)
+        k32.CloseHandle(handle)
         for h in vol_handles:
-            kernel32.DeviceIoControl(h, FSCTL_UNLOCK_VOLUME,
-                                      None, 0, None, 0, ctypes.byref(dummy), None)
-            kernel32.CloseHandle(h)
+            _ioctl(h, FSCTL_UNLOCK_VOLUME)
+            k32.CloseHandle(h)
 
 
 def _write_unix(image_path, device_path, progress_cb, cancel_event):
@@ -580,10 +631,7 @@ def _eject_windows(device_path):
     try:
         import ctypes
         from ctypes import wintypes
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        k32.CreateFileW.restype    = ctypes.c_void_p
-        k32.DeviceIoControl.restype = ctypes.c_bool
-        k32.CloseHandle.restype    = ctypes.c_bool
+        k32 = _setup_k32()
         GENERIC_READ  = 0x80000000
         GENERIC_WRITE = 0x40000000
         FILE_SHARE_READ  = 0x1
@@ -595,9 +643,9 @@ def _eject_windows(device_path):
                              FILE_SHARE_READ | FILE_SHARE_WRITE,
                              None, OPEN_EXISTING, 0, None)
         if h not in (None, INVALID_HANDLE):
-            dummy = wintypes.DWORD(0)
+            br = wintypes.DWORD(0)
             k32.DeviceIoControl(h, IOCTL_STORAGE_EJECT_MEDIA,
-                                 None, 0, None, 0, ctypes.byref(dummy), None)
+                                 None, 0, None, 0, ctypes.byref(br), None)
             k32.CloseHandle(h)
             log.info("Drive ejected.")
     except Exception as exc:

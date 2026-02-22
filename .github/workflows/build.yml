@@ -122,3 +122,38 @@ jobs:
             --prerelease
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Windows installer ────────────────────────────────────────────────────────
+  # Runs on a Windows runner so PyInstaller produces a native .exe.
+  # `needs: build` ensures the nightly release already exists before we
+  # try to upload to it.
+  installer:
+    needs: build
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build NoxiomInstaller.exe
+        run: >
+          python -m PyInstaller
+          --onefile --windowed --uac-admin
+          --name NoxiomInstaller
+          --distpath installer/dist
+          --workpath installer/build
+          --specpath installer
+          installer/noxiom_installer.py
+
+      - name: Upload installer to nightly release
+        run: gh release upload nightly installer/dist/NoxiomInstaller.exe --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
