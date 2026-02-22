@@ -487,14 +487,13 @@ def _ps_disk_offline(disk_num):
     try:
         result = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-             f"Set-Disk -Number {disk_num} -IsOffline $true"],
+             f"$ErrorActionPreference='Stop'; Set-Disk -Number {disk_num} -IsOffline $true"],
             capture_output=True, timeout=15,
         )
         ok = result.returncode == 0
-        if not ok:
-            log.debug(f"Set-Disk offline stderr: "
-                      f"{result.stderr.decode(errors='replace').strip()}")
-        log.debug(f"PowerShell Set-Disk offline: disk={disk_num} ok={ok}")
+        stderr = result.stderr.decode(errors='replace').strip()
+        log.debug(f"PowerShell Set-Disk offline: disk={disk_num} ok={ok} "
+                  f"rc={result.returncode} stderr={stderr!r}")
         return ok
     except Exception as exc:
         log.debug(f"PowerShell Set-Disk offline failed: {exc}")
@@ -530,15 +529,9 @@ def _write_windows(image_path, device_path, progress_cb, cancel_event):
     OPEN_EXISTING            = 3
     INVALID_HANDLE           = ctypes.c_void_p(-1).value
 
-    IOCTL_STORAGE_GET_DEVICE_NUMBER = 0x2D1080
     FSCTL_LOCK_VOLUME               = 0x00090018
     FSCTL_DISMOUNT_VOLUME           = 0x00090020
     FSCTL_UNLOCK_VOLUME             = 0x0009001C
-
-    class STORAGE_DEVICE_NUMBER(ctypes.Structure):
-        _fields_ = [("DeviceType", wintypes.DWORD),
-                    ("DeviceNumber", wintypes.DWORD),
-                    ("PartitionNumber", wintypes.DWORD)]
 
     def _ioctl(h, code, out_buf=None, out_size=0):
         br = wintypes.DWORD(0)
@@ -548,24 +541,6 @@ def _write_windows(image_path, device_path, progress_cb, cancel_event):
             out_buf, out_size,
             ctypes.byref(br), None,
         )
-
-    def _device_num(h):
-        sdn = STORAGE_DEVICE_NUMBER()
-        ok  = _ioctl(h, IOCTL_STORAGE_GET_DEVICE_NUMBER,
-                     ctypes.byref(sdn), ctypes.sizeof(sdn))
-        return int(sdn.DeviceNumber) if ok else -1
-
-    def _vol_disk_num(vol_path):
-        h = k32.CreateFileW(
-            vol_path.rstrip("\\"), 0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            None, OPEN_EXISTING, 0, None,
-        )
-        if h == INVALID_HANDLE or h is None:
-            return -1
-        n = _device_num(h)
-        k32.CloseHandle(h)
-        return n
 
     # Disk number from "\\.\PhysicalDriveN"
     try:
@@ -579,46 +554,43 @@ def _write_windows(image_path, device_path, progress_cb, cancel_event):
     # partitions that Windows can't open with write access individually.
     ps_offline = _ps_disk_offline(disk_num)
 
-    # ── Secondary: per-volume lock + dismount ─────────────────────────────────
-    # Belt-and-suspenders fallback if Set-Disk isn't supported for this drive
-    # type (some older USB readers return "not supported").
+    # ── Secondary: per-partition lock + dismount ──────────────────────────────
+    # Belt-and-suspenders fallback if Set-Disk isn't supported for this drive.
+    #
+    # IMPORTANT: We use \\.\HarddiskNPartitionM paths here, NOT FindFirstVolumeW.
+    # FindFirstVolumeW only returns Volume GUIDs for partitions Windows *recognises*
+    # (FAT32, NTFS, ReFS). Linux ext4/btrfs partitions have NO Volume GUID, so they
+    # are invisible to that API. However, they DO get a raw partition device node in
+    # the Windows storage stack (\\.\HarddiskNPartitionM), which we can open and lock.
     vol_handles = []
     if not ps_offline:
-        vol_paths = []
+        log.debug("Set-Disk offline unavailable; locking partitions by device path")
         if disk_num >= 0:
-            name_buf = ctypes.create_unicode_buffer(260)
-            hf = k32.FindFirstVolumeW(name_buf, 260)
-            if hf not in (None, INVALID_HANDLE):
-                while True:
-                    if _vol_disk_num(name_buf.value) == disk_num:
-                        vol_paths.append(name_buf.value)
-                    if not k32.FindNextVolumeW(hf, name_buf, 260):
+            for part_num in range(1, 32):
+                part_path = f"\\\\.\\Harddisk{disk_num}Partition{part_num}"
+                h = None
+                for access in [GENERIC_READ | GENERIC_WRITE, GENERIC_READ, 0]:
+                    tmp = k32.CreateFileW(
+                        part_path, access,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        None, OPEN_EXISTING, 0, None,
+                    )
+                    if tmp not in (INVALID_HANDLE, None):
+                        h = tmp
                         break
-                k32.FindVolumeClose(hf)
-        log.debug(f"Volumes on disk {disk_num}: {vol_paths}")
-
-        for vp in vol_paths:
-            # Try GENERIC_READ|GENERIC_WRITE first (full lock).
-            # Fall back to GENERIC_READ for volumes with unrecognised
-            # filesystems (ext4, btrfs, etc.) — Windows allows read-only
-            # access even when it can't write the filesystem.
-            h = None
-            for access in [GENERIC_READ | GENERIC_WRITE, GENERIC_READ]:
-                tmp = k32.CreateFileW(
-                    vp.rstrip("\\"), access,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    None, OPEN_EXISTING, 0, None,
-                )
-                if tmp not in (INVALID_HANDLE, None):
-                    h = tmp
-                    break
-            if h is None:
-                log.debug(f"Could not open {vp} at any access level (skipped)")
-                continue
-            ok_l = _ioctl(h, FSCTL_LOCK_VOLUME)
-            ok_d = _ioctl(h, FSCTL_DISMOUNT_VOLUME)
-            log.debug(f"  {vp}: lock={ok_l} dismount={ok_d}")
-            vol_handles.append(h)
+                if h is None:
+                    err = ctypes.get_last_error()
+                    # 2=file not found, 3=path not found, 87=invalid param,
+                    # 1168=element not found — all mean the partition does not exist.
+                    log.debug(f"  {part_path}: open failed err={err}")
+                    if err in (2, 3, 87, 1168):
+                        break   # No more partitions on this disk
+                    continue    # Unexpected error; skip this slot and keep going
+                ok_l = _ioctl(h, FSCTL_LOCK_VOLUME)
+                ok_d = _ioctl(h, FSCTL_DISMOUNT_VOLUME)
+                log.debug(f"  {part_path}: lock={ok_l} dismount={ok_d}")
+                vol_handles.append(h)
+        log.debug(f"Locked {len(vol_handles)} partitions")
 
     # Open physical drive for writing.
     handle = k32.CreateFileW(
@@ -636,7 +608,6 @@ def _write_windows(image_path, device_path, progress_cb, cancel_event):
         raise OSError(_win_err(err))
 
     written_total = 0
-    write_ok = False
     try:
         io_buf = (ctypes.c_char * CHUNK)()
         with open(image_path, "rb") as f:
@@ -659,16 +630,17 @@ def _write_windows(image_path, device_path, progress_cb, cancel_event):
                     raise OSError(_win_err(err))
                 written_total += written.value
                 progress_cb(written_total)
-        write_ok = True
         log.info(f"Write complete: {written_total} bytes")
     finally:
         k32.CloseHandle(handle)
         for h in vol_handles:
             _ioctl(h, FSCTL_UNLOCK_VOLUME)
             k32.CloseHandle(h)
-        # If we took the disk offline and the write failed, bring it back so
-        # the user doesn't end up with a stuck-offline drive.
-        if ps_offline and not write_ok:
+        # Always bring the disk back online after we're done (success OR failure).
+        # If we leave it offline after a successful write, Windows tries to re-read
+        # the old (now-overwritten) partition table from cache and shows
+        # "cannot read partition 4 and 5" errors.
+        if ps_offline:
             _ps_disk_online(disk_num)
 
 
