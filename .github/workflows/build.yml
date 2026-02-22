@@ -124,9 +124,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ── Windows installer ────────────────────────────────────────────────────────
-  # Runs on a Windows runner so PyInstaller produces a native .exe.
-  # `needs: build` ensures the nightly release already exists before we
-  # try to upload to it.
+  # Publishes NoxiomInstaller.exe as a normal (non-pre-release) release so it
+  # appears first on the GitHub Releases page.  The nightly .img builds remain
+  # pre-releases and show up below it.
   installer:
     needs: build
     runs-on: windows-latest
@@ -153,7 +153,23 @@ jobs:
           --specpath installer
           installer/noxiom_installer.py
 
-      - name: Upload installer to nightly release
-        run: gh release upload nightly installer/dist/NoxiomInstaller.exe --clobber
+      - name: Delete old installer release (if exists)
+        run: gh release delete installer --yes 2>$null; exit 0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete old installer tag (if exists)
+        run: git push origin :refs/tags/installer 2>$null; exit 0
+
+      - name: Publish installer as stable release
+        run: >
+          gh release create installer
+          installer/dist/NoxiomInstaller.exe
+          --title "Noxiom OS Installer"
+          --notes "Windows installer for Noxiom OS.
+
+          Downloads the latest OS image automatically and flashes it to your SD card or USB drive.
+
+          **How to use:** Run NoxiomInstaller.exe as Administrator, select your target drive, choose your architecture, and click Install."
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
