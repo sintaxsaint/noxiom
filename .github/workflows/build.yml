@@ -1,0 +1,60 @@
+name: Build Noxiom OS
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write   # needed to create/update releases
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            nasm \
+            gcc \
+            binutils \
+            build-essential \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu
+
+      - name: Build x86_64
+        run: make ARCH=x86_64
+
+      - name: Build arm64
+        run: make ARCH=arm64
+
+      - name: Collect release images
+        run: make dist
+
+      - name: Delete old nightly pre-release (if exists)
+        run: gh release delete nightly --yes 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete old nightly tag (if exists)
+        run: git push origin :refs/tags/nightly 2>/dev/null || true
+
+      - name: Create pre-release
+        run: |
+          gh release create nightly \
+            imgs/noxiom-x86_64.img \
+            imgs/noxiom-arm64.img \
+            --title "Noxiom OS — Latest Build" \
+            --notes "Automated build from commit ${{ github.sha }}
+
+            Built on: $(date -u '+%Y-%m-%d %H:%M UTC')
+
+            **This is a pre-release / development build.**
+            Use the installer to flash to your target device." \
+            --prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
