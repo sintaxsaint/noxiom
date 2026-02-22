@@ -24,7 +24,9 @@ jobs:
             binutils \
             build-essential \
             gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu
+            binutils-aarch64-linux-gnu \
+            dosfstools \
+            mtools
 
       - name: Build x86_64
         run: make ARCH=x86_64
@@ -32,9 +34,53 @@ jobs:
       - name: Build arm64
         run: make ARCH=arm64
 
-      - name: Collect release images
-        run: make dist
+      # ── x86_64 image ──────────────────────────────────────────────────────
+      # The x86_64 Makefile already produces a proper raw disk image via dd.
+      - name: Collect x86_64 image
+        run: |
+          mkdir -p imgs
+          cp noxiom/build/x86_64/noxiom.img imgs/noxiom-x86_64.img
 
+      # ── arm64 image ───────────────────────────────────────────────────────
+      # The Pi GPU bootloader needs a FAT32 partition containing:
+      #   - Official Pi firmware files (start.elf, fixup.dat, etc.)
+      #   - kernel8.img  (our kernel)
+      #   - config.txt   (tells the GPU to load a 64-bit kernel via PL011 UART)
+      # Without these firmware files the Pi ignores the SD card and shows its
+      # own recovery/install screen.
+      - name: Download Raspberry Pi firmware files
+        run: |
+          mkdir -p pi-fw
+          FW="https://github.com/raspberrypi/firmware/raw/master/boot"
+          for f in bootcode.bin start.elf fixup.dat start4.elf fixup4.dat \
+                   start_cd.elf fixup_cd.dat; do
+            echo "  Downloading $f..."
+            curl -sL "$FW/$f" -o "pi-fw/$f"
+          done
+
+      - name: Create arm64 FAT32 SD card image
+        run: |
+          # 64 MB is plenty for firmware files + kernel (total ~30 MB)
+          dd if=/dev/zero of=imgs/noxiom-arm64.img bs=1M count=64 status=none
+          mkfs.fat -F 32 -n NOXIOM imgs/noxiom-arm64.img
+
+          # mtools lets us copy files into FAT images without root/mount
+          mcopy -i imgs/noxiom-arm64.img pi-fw/bootcode.bin   ::bootcode.bin
+          mcopy -i imgs/noxiom-arm64.img pi-fw/start.elf      ::start.elf
+          mcopy -i imgs/noxiom-arm64.img pi-fw/fixup.dat      ::fixup.dat
+          mcopy -i imgs/noxiom-arm64.img pi-fw/start4.elf     ::start4.elf
+          mcopy -i imgs/noxiom-arm64.img pi-fw/fixup4.dat     ::fixup4.dat
+          mcopy -i imgs/noxiom-arm64.img pi-fw/start_cd.elf   ::start_cd.elf
+          mcopy -i imgs/noxiom-arm64.img pi-fw/fixup_cd.dat   ::fixup_cd.dat
+          mcopy -i imgs/noxiom-arm64.img \
+                noxiom/build/arm64/kernel8.img                ::kernel8.img
+          mcopy -i imgs/noxiom-arm64.img \
+                noxiom/arch/arm64/boot/config.txt             ::config.txt
+
+          echo "arm64 image contents:"
+          mdir -i imgs/noxiom-arm64.img
+
+      # ── Publish pre-release ───────────────────────────────────────────────
       - name: Delete old nightly pre-release (if exists)
         run: gh release delete nightly --yes 2>/dev/null || true
         env:
@@ -51,10 +97,10 @@ jobs:
             --title "Noxiom OS — Latest Build" \
             --notes "Automated build from commit ${{ github.sha }}
 
-            Built on: $(date -u '+%Y-%m-%d %H:%M UTC')
+          Built on: $(date -u '+%Y-%m-%d %H:%M UTC')
 
-            **This is a pre-release / development build.**
-            Use the installer to flash to your target device." \
+          **This is a pre-release / development build.**
+          Use the installer to flash to your target device." \
             --prerelease
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
