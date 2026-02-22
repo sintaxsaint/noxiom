@@ -10,6 +10,7 @@ QEMU := qemu-system-x86_64
 BUILD := build/x86_64
 
 CFLAGS := -std=c11 -ffreestanding -fno-stack-protector \
+          -fno-pic -fno-pie \
           -mno-80387 -mno-mmx -mno-sse -mno-sse2 -mno-red-zone \
           -mcmodel=kernel -Wall -Wextra \
           -Ikernel/src -Iarch/x86_64
